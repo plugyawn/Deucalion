@@ -13,32 +13,32 @@ Commands
    dpo-adl build-delta \
      --ref_model Qwen/Qwen2.5-0.5B \
      --dpo_model Qwen/Qwen2.5-0.5B-Instruct \
-     --n_probe 20 --k 5 --batch_size 5 \
-     --out artifacts/delta_qwen0p5b.pt
+     --n_probe 400 --k 5 --batch_size 16 \
+     --out artifacts/delta_qwen0p5b_n400.pt
 
    Output: artifacts/delta_qwen0p5b.pt
    Notes: delta shape = (5, 896)
 
-2) Patchscope readout (token-identity; α = 1.0):
+2) Patchscope readout (token-identity; α sweep + norm-match):
    dpo-adl patchscope \
      --reader_model Qwen/Qwen2.5-0.5B-Instruct \
-     --delta artifacts/delta_qwen0p5b.pt \
-     --alpha 1.0 --topk 10
+     --delta artifacts/delta_qwen0p5b_n400.pt \
+     --alpha_sweep 0.5,1.0,1.5,2.0 --topk 10 --norm_match True
 
    Output: JSON lines per position j with Top-10 tokens and an entropy proxy.
 
-3) Δ-steering + DPO margin (5 neutral prompts; max_new_tokens=32):
+3) Δ-steering + DPO margin + embedding similarity plot (5 prompts):
    dpo-adl eval-steer \
      --ref_model Qwen/Qwen2.5-0.5B \
      --dpo_model Qwen/Qwen2.5-0.5B-Instruct \
-     --delta artifacts/delta_qwen0p5b.pt \
+     --delta artifacts/delta_qwen0p5b_n400.pt \
      --prompts experiments/exp01_prompts.txt \
-     --max_new_tokens 32 --temperature 0.0 --alpha 1.0
+     --max_new_tokens 32 --temperature 0.0 --alpha 1.0 \
+     --plot_out artifacts/exp01_embed.png
 
    Output: JSON per prompt with fields: margin_unsteered, margin_steered, delta.
 
 Smoke test status: PASS
-- Δ file created and loadable with expected shape (5, 896)
+- Δ file created and loadable with expected shape (5, 896) using n_probe=400
 - Patchscope printed token lists for multiple positions
-- Eval-steer produced JSON margins for 5 prompts
-
+- Eval-steer produced JSON margins for 5 prompts and saved plot at artifacts/exp01_embed.png

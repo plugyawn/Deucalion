@@ -7,6 +7,7 @@ from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
 from dpo_adl.backends.hf_hooks import capture_residual_means, load_model_and_tokenizer, num_layers
 from dpo_adl.utils.logging import get_logger
+from tqdm import tqdm
 
 
 log = get_logger()
@@ -38,14 +39,17 @@ def compute_means_for_model(
     cap_mean = None
     with torch.inference_mode(), capture_residual_means(model, layer_idx, k_first_tokens=k, mode=mode) as cap:
         buf: list[str] = []
-        for t in texts_iter:
+        count = 0
+        for t in tqdm(texts_iter, desc=f"means:{model_id.split('/')[-1]}"):
             buf.append(t)
+            count += 1
             if len(buf) >= batch_size:
                 model(**_tok_batch(tok, buf, k, model.device))
                 buf.clear()
         if buf:
             model(**_tok_batch(tok, buf, k, model.device))
         cap_mean = cap.mean()  # [k, d]
+        assert cap_mean.shape[0] == k and cap_mean.ndim == 2, "Mean activations shape incorrect."
     d_model = cap_mean.shape[-1]
     return cap_mean, d_model
 
@@ -67,5 +71,5 @@ def build_delta(
         raise ValueError("texts_iter must be re-iterable for two passes.")
     mu_dpo, _ = compute_means_for_model(dpo_model_id, texts_iter, k, layer_idx, batch_size, mode)
     delta = mu_dpo - mu_ref
+    assert delta.shape == mu_ref.shape, "Delta shape mismatch."
     return delta  # [k, d_model]
-

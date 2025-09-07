@@ -6,6 +6,8 @@ import torch
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
 from dpo_adl.backends.hf_hooks import identity_patch_at_position, num_layers
+from dpo_adl.backends.hf_hooks import estimate_expected_norm
+from tqdm import tqdm
 
 
 DEFAULT_PROMPTS = [
@@ -32,6 +34,8 @@ def patchscope_logits(
     alpha: float,
     prompt_text: str,
     sentinel: str = "?",
+    norm_match: bool = False,
+    expected_norm: float | None = None,
 ) -> torch.Tensor:
     if layer_idx is None:
         layer_idx = num_layers(model) // 2
@@ -44,7 +48,12 @@ def patchscope_logits(
         raise ValueError("Prompt must contain exactly one sentinel token.")
     pos = int(matches[0].item())
     # Prepare hook that overwrites the sentinel position
-    handle = identity_patch_at_position(model, layer_idx, pos, delta_j, alpha=alpha)
+    # Optionally norm-match delta_j before applying alpha
+    vec = delta_j
+    if norm_match:
+        assert expected_norm is not None and expected_norm > 0
+        vec = vec * (expected_norm / (vec.norm(p=2) + 1e-6))
+    handle = identity_patch_at_position(model, layer_idx, pos, vec, alpha=alpha)
     try:
         with torch.inference_mode():
             out = model(**{k: v.to(model.device) for k, v in batch.items()})
@@ -59,4 +68,3 @@ def top_tokens_from_probs(tok: PreTrainedTokenizerBase, probs: torch.Tensor, top
     vals, idx = torch.topk(probs, k=topk, dim=-1)
     tokens = [tok.decode([int(i)]) for i in idx.tolist()]
     return list(zip(tokens, vals.tolist()))
-

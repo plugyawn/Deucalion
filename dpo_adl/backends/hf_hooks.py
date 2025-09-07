@@ -6,6 +6,7 @@ from typing import Callable, Optional, Tuple
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
+from tqdm import tqdm
 
 
 def load_model_and_tokenizer(model_id: str, dtype: str = "auto") -> Tuple[PreTrainedModel, PreTrainedTokenizerBase]:
@@ -35,6 +36,14 @@ def load_model_and_tokenizer(model_id: str, dtype: str = "auto") -> Tuple[PreTra
         low_cpu_mem_usage=True,
     )
     model.eval()
+    # Log unique devices used (helps validate multi-GPU sharding)
+    try:
+        devs = {str(p.device) for p in model.parameters() if p.requires_grad or True}
+        print(f"[dpo-adl] model devices: {sorted(list(devs))}")
+        if torch.cuda.is_available():
+            assert any("cuda" in d for d in devs), "CUDA available but model not on GPU devices."
+    except Exception:
+        pass
     return model, tok
 
 
@@ -104,6 +113,57 @@ class ResidCapture:
         return (self.sum / self.count).to(torch.float32)
 
 
+class NormCapture:
+    """Capture L2 norms across tokens to estimate expected activation norm at a layer.
+
+    Stores norms on CPU as a running list to compute a median later.
+    """
+
+    def __init__(self, k_first_tokens: int = 8, skip_first: int = 3):
+        self.k = k_first_tokens
+        self.skip = skip_first
+        self.norms: list[float] = []
+
+    def _pre(self, module, inputs):
+        (hidden_states, *_) = inputs
+        hs = hidden_states[:, : self.k, :]
+        if self.k > self.skip:
+            hs = hs[:, self.skip :, :]
+        n = torch.linalg.vector_norm(hs, ord=2, dim=-1).detach().to("cpu")
+        self.norms.extend(n.flatten().tolist())
+        return None
+
+
+def estimate_expected_norm(
+    model: PreTrainedModel,
+    tok: PreTrainedTokenizerBase,
+    texts: list[str],
+    layer_idx: int,
+    k_first_tokens: int = 8,
+    skip_first: int = 3,
+    batch_size: int = 32,
+):
+    layers = resolve_decoder_layers(model)
+    layer = layers[layer_idx]
+    cap = NormCapture(k_first_tokens=k_first_tokens, skip_first=skip_first)
+    handle = layer.register_forward_pre_hook(cap._pre, with_kwargs=False)
+    try:
+        for i in tqdm(range(0, len(texts), batch_size), desc="estim-norm", leave=False):
+            batch = texts[i : i + batch_size]
+            if not batch:
+                continue
+            toks = tok(batch, return_tensors="pt", truncation=True, max_length=k_first_tokens, padding=True)
+            toks = {k: v.to(model.device) for k, v in toks.items()}
+            with torch.inference_mode():
+                _ = model(**toks)
+        assert len(cap.norms) > 0, "Expected norm capture collected no values."
+        med = float(torch.tensor(cap.norms).median().item())
+        assert med > 0, "Expected norm median is non-positive."
+        return med
+    finally:
+        handle.remove()
+
+
 @contextlib.contextmanager
 def capture_residual_means(model: PreTrainedModel, layer_idx: int, k_first_tokens: int = 5, mode: str = "pre"):
     layers = resolve_decoder_layers(model)
@@ -150,4 +210,3 @@ def add_delta_all_positions(model: PreTrainedModel, layer_idx: int, vec: torch.T
     layer = layers[layer_idx]
     handle = layer.register_forward_pre_hook(_pre, with_kwargs=False)
     return handle
-

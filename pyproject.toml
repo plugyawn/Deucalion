@@ -15,6 +15,9 @@ dependencies = [
   "datasets>=2.19",
   "einops",
   "tyro>=0.8.5",
+  "tqdm>=4.66",
+  "matplotlib>=3.8",
+  "sentence-transformers>=2.6",
 ]
 
 [project.scripts]

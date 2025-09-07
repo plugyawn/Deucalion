@@ -6,6 +6,8 @@ import torch
 from transformers import GenerationConfig, PreTrainedModel, PreTrainedTokenizerBase
 
 from dpo_adl.backends.hf_hooks import add_delta_all_positions, num_layers
+from dpo_adl.backends.hf_hooks import estimate_expected_norm
+from tqdm import tqdm
 
 
 @torch.inference_mode()
@@ -43,4 +45,3 @@ def steered_generation(
         return generate_text(model, tok, prompt, max_new_tokens=max_new_tokens, temperature=temperature)
     finally:
         handle.remove()
-
