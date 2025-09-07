@@ -14,8 +14,10 @@ from dpo_adl.diff.delta_builder import build_delta
 from dpo_adl.dpo.implicit_reward import dpo_margin
 from dpo_adl.eval.steering import generate_text, steered_generation
 from dpo_adl.eval.embeds import Embedder
+from dpo_adl.eval.plots import plot_entropy_vs_alpha, plot_margins_per_prompt, plot_margin_deltas, plot_embed_similarity
 from dpo_adl.patchscope.token_identity import DEFAULT_PROMPTS, patchscope_logits, top_tokens_from_probs
 from dpo_adl.utils.logging import get_logger
+from dpo_adl.utils.exp import create_exp_dir, snapshot_code
 
 
 log = get_logger()
@@ -185,6 +187,11 @@ class CmdEvalSteer:
             try:
                 import matplotlib.pyplot as plt
                 import numpy as np
+                Path(self.plot_out).parent.mkdir(parents=True, exist_ok=True)
+                # Save separate and side-by-side plots
+                from dpo_adl.eval.plots import plot_embed_similarity
+                plot_embed_similarity(sim_un, sim_st, Path(self.plot_out).parent)
+                # Also save a simple combined filename for backward compatibility
                 x = np.arange(len(prompts))
                 w = 0.35
                 fig, ax = plt.subplots(figsize=(10, 4))
@@ -194,12 +201,140 @@ class CmdEvalSteer:
                 ax.set_xlabel("prompt idx")
                 ax.set_title("Embedding similarity vs ref_model outputs")
                 ax.legend()
-                Path(self.plot_out).parent.mkdir(parents=True, exist_ok=True)
                 plt.tight_layout()
                 plt.savefig(self.plot_out)
-                log.info(f"Saved plot: {self.plot_out}")
+                log.info(f"Saved comparison plot: {self.plot_out}")
             except Exception as e:
                 log.warning(f"Plotting failed: {e}")
+
+
+@dataclass
+class CmdRunExp:
+    name: str = "exp02"
+    ref_model: str = "Qwen/Qwen2.5-0.5B"
+    dpo_model: str = "Qwen/Qwen2.5-0.5B-Instruct"
+    n_probe: int = 1200
+    k: int = 5
+    batch_size: int = 16
+    layer_idx: Optional[int] = None
+    prompts: str = "prompts/generic20.txt"
+    alpha_sweep: str = "0.5,1.0,1.5,2.0"
+    norm_match: bool = True
+    sentinel: str = "?"
+    max_new_tokens: int = 64
+    temperature: float = 0.0
+    embed_model: str = "sentence-transformers/all-MiniLM-L6-v2"
+
+    def __call__(self):
+        exp_dir = create_exp_dir(self.name)
+        snapshot_code(exp_dir)
+        cfg = {
+            "ref_model": self.ref_model,
+            "dpo_model": self.dpo_model,
+            "n_probe": self.n_probe,
+            "k": self.k,
+            "batch_size": self.batch_size,
+            "layer_idx": self.layer_idx,
+            "prompts": self.prompts,
+            "alpha_sweep": self.alpha_sweep,
+            "norm_match": self.norm_match,
+            "sentinel": self.sentinel,
+            "max_new_tokens": self.max_new_tokens,
+            "temperature": self.temperature,
+            "embed_model": self.embed_model,
+        }
+        (exp_dir / "config.json").write_text(json.dumps(cfg, indent=2))
+
+        # 1) Build Δ
+        model, tok = load_model_and_tokenizer(self.dpo_model)
+        from dpo_adl.data.fineweb import iter_probe_texts
+        texts = list(iter_probe_texts("HuggingFaceFW/fineweb-edu", "train", self.n_probe, seed=0))
+        from dpo_adl.diff.delta_builder import build_delta
+        delta = build_delta(self.ref_model, self.dpo_model, texts, k=self.k, layer_idx=self.layer_idx, batch_size=self.batch_size)
+        torch.save({"delta": delta, "k": self.k, "layer_idx": self.layer_idx}, exp_dir / "artifacts" / "delta.pt")
+
+        # 2) Patchscope alpha sweep & entropy plots per j
+        alphas = [float(x) for x in self.alpha_sweep.split(",") if x.strip()]
+        prompts = [p for p in Path(self.prompts).read_text().splitlines() if p.strip()]
+        from dpo_adl.patchscope.token_identity import patchscope_logits, DEFAULT_PROMPTS
+        token_id_prompts = DEFAULT_PROMPTS  # use token-identity prompts for Patchscope
+        # Estimate expected norm (optional)
+        expected_norm = None
+        if self.norm_match:
+            L = num_layers(model)
+            layer_idx = self.layer_idx if self.layer_idx is not None else L // 2
+            from dpo_adl.backends.hf_hooks import estimate_expected_norm
+            expected_norm = estimate_expected_norm(model, tok, token_id_prompts * 32, layer_idx, k_first_tokens=8, skip_first=3, batch_size=32)
+
+        entropies_per_j = {}
+        best_by_j = {}
+        for j in range(delta.shape[0]):
+            ent_per_a = {}
+            best = None
+            for a in alphas:
+                probs_sets = []
+                for p in token_id_prompts:
+                    probs = patchscope_logits(
+                        model, tok, self.layer_idx, delta[j], a, p, self.sentinel, norm_match=self.norm_match, expected_norm=expected_norm
+                    )
+                    probs_sets.append(probs)
+                top_sets = [torch.topk(p, k=100).indices for p in probs_sets]
+                inter = set(top_sets[0].tolist())
+                for s in top_sets[1:]:
+                    inter &= set(s.tolist())
+                avg_p = torch.stack(probs_sets, dim=0).mean(dim=0)
+                if len(inter) == 0:
+                    entropy = float("inf")
+                else:
+                    mask = torch.zeros_like(avg_p)
+                    idx = torch.tensor(sorted(list(inter)), dtype=torch.long)
+                    mask[idx] = 1.0
+                    p_sel = (avg_p * mask)
+                    p_sel = p_sel / p_sel.sum()
+                    entropy = float((-p_sel[p_sel>0].log() * p_sel[p_sel>0]).sum().item())
+                ent_per_a[a] = entropy
+                top_tokens = top_tokens_from_probs(tok, avg_p, topk=20)
+                cand = {"j": j, "alpha": a, "entropy": entropy, "top": top_tokens}
+                if best is None or cand["entropy"] < best["entropy"]:
+                    best = cand
+            entropies_per_j[j] = ent_per_a
+            best_by_j[j] = best
+        plot_entropy_vs_alpha(entropies_per_j, exp_dir / "plots")
+        # Choose best j overall
+        best_overall = min(best_by_j.values(), key=lambda r: r["entropy"])
+        (exp_dir / "artifacts" / "patchscope_best.json").write_text(json.dumps({"best": best_overall, "by_j": best_by_j}, ensure_ascii=False, indent=2))
+
+        # 3) Steering + margins + embeddings and plots
+        ref_m, ref_tok = load_model_and_tokenizer(self.ref_model)
+        from dpo_adl.eval.steering import batched_eval_margins
+        res = batched_eval_margins(
+            prompts, model, ref_m, tok, ref_tok, delta_vec=delta[best_overall["j"]], layer_idx=self.layer_idx,
+            alpha=best_overall["alpha"], max_new_tokens=self.max_new_tokens, temperature=self.temperature,
+        )
+        # Save results JSON
+        out_rows = []
+        un, st, deltas = [], [], []
+        un_texts, st_texts = [], []
+        for (p, y0, y1, m0, m1) in res:
+            out_rows.append({"prompt": p, "unsteered": m0, "steered": m1, "delta": m1 - m0})
+            un.append(m0); st.append(m1); deltas.append(m1 - m0)
+            un_texts.append(y0); st_texts.append(y1)
+        (exp_dir / "artifacts" / "steer_margins.json").write_text(json.dumps(out_rows, indent=2))
+        # Embedding similarity vs ref outputs
+        ref_texts = [generate_text(ref_m, ref_tok, p, max_new_tokens=self.max_new_tokens, temperature=self.temperature) for p in prompts]
+        emb = Embedder(self.embed_model)
+        E_ref = emb.encode(ref_texts)
+        E_un = emb.encode(un_texts)
+        E_st = emb.encode(st_texts)
+        sim_un = (E_un @ E_ref.T).diagonal().tolist()
+        sim_st = (E_st @ E_ref.T).diagonal().tolist()
+        (exp_dir / "artifacts" / "embed_similarity.json").write_text(json.dumps({"un": sim_un, "st": sim_st}, indent=2))
+        # Plots
+        plot_margins_per_prompt(un, st, exp_dir / "plots")
+        plot_margin_deltas(deltas, exp_dir / "plots")
+        plot_embed_similarity(sim_un, sim_st, exp_dir / "plots")
+
+        print(json.dumps({"exp_dir": str(exp_dir), "best": best_overall, "avg_margin_delta": sum(deltas)/max(1,len(deltas))}))
 
 
 def main():
@@ -218,6 +353,9 @@ def main():
     elif cmd == "eval-steer":
         tyro.extras.set_accent_color("magenta")
         tyro.cli(CmdEvalSteer, args=args)()
+    elif cmd == "run-exp":
+        tyro.extras.set_accent_color("cyan")
+        tyro.cli(CmdRunExp, args=args)()
     else:
         print(f"Unknown command: {cmd}")
 

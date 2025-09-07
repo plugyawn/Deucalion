@@ -1,0 +1,43 @@
+Experiment: EXP02 — Qwen2.5-0.5B (base vs instruct) DPO-ADL end-to-end
+
+Objective
+- Larger probe set (n_probe≈600–1200) to strengthen Δ; add alpha sweep with expected-norm scaling; log full artifacts and plots to a timestamped folder under assets/experiments/outputs/, including a code snapshot.
+
+Models
+- ref_model: Qwen/Qwen2.5-0.5B
+- dpo_model: Qwen/Qwen2.5-0.5B-Instruct
+
+Probe data
+- Dataset: HuggingFaceFW/fineweb-edu (streaming)
+- n_probe: 1200 (k=5 tokens each), batch_size=16
+
+Command (run inside `.venv`)
+  dpo-adl run-exp \
+    --name EXP02_qwen0p5b \
+    --ref_model Qwen/Qwen2.5-0.5B \
+    --dpo_model Qwen/Qwen2.5-0.5B-Instruct \
+    --n_probe 1200 --k 5 --batch_size 16 \
+    --alpha_sweep 0.5,1.0,1.5,2.0 \
+    --prompts prompts/generic20.txt \
+    --max_new_tokens 48 --temperature 0.0
+
+Outputs (example; path will be timestamped)
+- assets/experiments/outputs/2025MMDD_HHMMSS_EXP02_qwen0p5b/
+  - config.json — experiment parameters
+  - code/ — snapshot of this codebase (no data or model weights)
+  - artifacts/
+    - delta.pt — Δ tensor and metadata (k, layer_idx)
+    - patchscope_best.json — best (j, alpha, entropy, top tokens) and per-j details
+    - steer_margins.json — per-prompt margins (unsteered, steered, delta)
+    - embed_similarity.json — cosine similarity vs ref outputs (un, st)
+  - plots/
+    - patchscope_entropy_j{0..4}.png — entropy vs alpha (per position)
+    - margins_per_prompt.png — DPO margins per prompt (side-by-side)
+    - margin_delta_box.png — distribution of margin deltas
+    - embed_sim_unsteered.png — unsteered→ref cosine similarity
+    - embed_sim_steered.png — steered→ref cosine similarity
+    - embed_sim_side_by_side.png — side-by-side comparison plot
+
+Smoke test status: PASS
+- All artifacts created; multiple plots saved; code snapshot present.
+

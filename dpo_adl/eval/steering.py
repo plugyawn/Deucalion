@@ -45,3 +45,26 @@ def steered_generation(
         return generate_text(model, tok, prompt, max_new_tokens=max_new_tokens, temperature=temperature)
     finally:
         handle.remove()
+
+
+def batched_eval_margins(
+    prompts: list[str],
+    dpo_m: PreTrainedModel,
+    ref_m: PreTrainedModel,
+    dpo_tok: PreTrainedTokenizerBase,
+    ref_tok: PreTrainedTokenizerBase,
+    delta_vec: torch.Tensor,
+    layer_idx: int | None,
+    alpha: float,
+    max_new_tokens: int,
+    temperature: float,
+):
+    results = []
+    for p in tqdm(prompts, desc="eval-steer", leave=False):
+        y0 = generate_text(dpo_m, dpo_tok, p, max_new_tokens=max_new_tokens, temperature=temperature)
+        from dpo_adl.dpo.implicit_reward import dpo_margin
+        m0 = dpo_margin(dpo_m, ref_m, dpo_tok, ref_tok, p, y0[len(p):])
+        y1 = steered_generation(dpo_m, dpo_tok, p, delta_vec, layer_idx=layer_idx, alpha=alpha, max_new_tokens=max_new_tokens, temperature=temperature)
+        m1 = dpo_margin(dpo_m, ref_m, dpo_tok, ref_tok, p, y1[len(p):])
+        results.append((p, y0, y1, m0, m1))
+    return results

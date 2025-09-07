@@ -17,6 +17,7 @@ dist/
 # Data & outputs
 artifacts/
 logs/
+assets/experiments/outputs/
 *.pt
 *.bin
 *.npz
@@ -27,4 +28,3 @@ logs/
 Thumbs.db
 .idea/
 .vscode/
-
