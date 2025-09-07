@@ -18,6 +18,7 @@ from dpo_adl.eval.plots import plot_entropy_vs_alpha, plot_margins_per_prompt, p
 from dpo_adl.patchscope.token_identity import DEFAULT_PROMPTS, patchscope_logits, top_tokens_from_probs
 from dpo_adl.utils.logging import get_logger
 from dpo_adl.utils.exp import create_exp_dir, snapshot_code
+from dpo_adl.eval.report import bundle_plots_to_pdf
 
 
 log = get_logger()
@@ -224,6 +225,7 @@ class CmdRunExp:
     max_new_tokens: int = 64
     temperature: float = 0.0
     embed_model: str = "sentence-transformers/all-MiniLM-L6-v2"
+    make_pdf: bool = True
 
     def __call__(self):
         exp_dir = create_exp_dir(self.name)
@@ -333,6 +335,24 @@ class CmdRunExp:
         plot_margins_per_prompt(un, st, exp_dir / "plots")
         plot_margin_deltas(deltas, exp_dir / "plots")
         plot_embed_similarity(sim_un, sim_st, exp_dir / "plots")
+
+        # 4) Bundle report PDF
+        if self.make_pdf:
+            try:
+                bundle_plots_to_pdf(
+                    exp_dir / "plots",
+                    exp_dir / "report.pdf",
+                    order=[
+                        "patchscope_entropy_j",
+                        "margins_per_prompt",
+                        "margin_delta_box",
+                        "embed_sim_unsteered",
+                        "embed_sim_steered",
+                        "embed_sim_side_by_side",
+                    ],
+                )
+            except Exception as e:
+                log.warning(f"Failed to create PDF report: {e}")
 
         print(json.dumps({"exp_dir": str(exp_dir), "best": best_overall, "avg_margin_delta": sum(deltas)/max(1,len(deltas))}))
 

@@ -1,0 +1,23 @@
+Experiment: EXP03 — Qwen2.5-0.5B (base vs instruct), n_probe=2000, PDF report
+
+Command (inside `.venv`):
+  dpo-adl run-exp \
+    --name EXP03_qwen0p5b \
+    --ref_model Qwen/Qwen2.5-0.5B \
+    --dpo_model Qwen/Qwen2.5-0.5B-Instruct \
+    --n_probe 2000 --k 5 --batch_size 24 \
+    --alpha_sweep 0.5,1.0,1.5,2.0 \
+    --prompts prompts/generic20.txt \
+    --max_new_tokens 48 --temperature 0.0
+
+Outputs example (timestamped):
+- assets/experiments/outputs/20250907_105917_EXP03_qwen0p5b/
+  - artifacts/: delta.pt, patchscope_best.json, steer_margins.json, embed_similarity.json
+  - plots/: patchscope_entropy_j{0..4}.png, margins_per_prompt.png, margin_delta_box.png,
+            embed_sim_unsteered.png, embed_sim_steered.png, embed_sim_side_by_side.png
+  - report.pdf — bundled copy of the above plots (one per page, with captions)
+  - code/ — code snapshot
+  - config.json — parameters
+
+Status: PASS — individual plots present and report.pdf saved.
+
