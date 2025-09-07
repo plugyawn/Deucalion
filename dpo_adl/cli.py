@@ -19,8 +19,14 @@ from dpo_adl.patchscope.token_identity import DEFAULT_PROMPTS, patchscope_logits
 from dpo_adl.utils.logging import get_logger
 from dpo_adl.utils.exp import create_exp_dir, snapshot_code
 from dpo_adl.eval.report import bundle_plots_to_pdf
-from dpo_adl.train.datasets import load_synthetic_british, SyntheticBritishConfig, load_hf_preference_dataset
+from dpo_adl.train.datasets import (
+    load_synthetic_british,
+    SyntheticBritishConfig,
+    load_hf_preference_dataset,
+    chosen_texts_from_spec,
+)
 from dpo_adl.train.dpo_trainer import DPOTrainConfig, train_dpo_on_dataset
+from dpo_adl.diff.orth import project_out
 
 
 log = get_logger()
@@ -228,6 +234,14 @@ class CmdRunExp:
     temperature: float = 0.0
     embed_model: str = "sentence-transformers/all-MiniLM-L6-v2"
     make_pdf: bool = True
+    # Embedding baseline target
+    embed_to: str = "ref"  # "ref" or "dpo-chosen"
+    embed_ds_name: Optional[str] = None
+    embed_ds_split: str = "train_prefs"
+    embed_ds_n: int = 1000
+    # Orthogonalization
+    orthogonalize: bool = False
+    base_model: Optional[str] = None
 
     def __call__(self):
         exp_dir = create_exp_dir(self.name)
@@ -256,6 +270,12 @@ class CmdRunExp:
         from dpo_adl.diff.delta_builder import build_delta
         delta = build_delta(self.ref_model, self.dpo_model, texts, k=self.k, layer_idx=self.layer_idx, batch_size=self.batch_size)
         torch.save({"delta": delta, "k": self.k, "layer_idx": self.layer_idx}, exp_dir / "artifacts" / "delta.pt")
+        # Optional Δ_SFT for orthogonalization
+        delta_sft = None
+        if self.orthogonalize:
+            assert self.base_model is not None, "Provide --base_model when --orthogonalize is set."
+            delta_sft = build_delta(self.base_model, self.ref_model, texts, k=self.k, layer_idx=self.layer_idx, batch_size=self.batch_size)
+            torch.save({"delta": delta_sft, "k": self.k, "layer_idx": self.layer_idx}, exp_dir / "artifacts" / "delta_sft.pt")
 
         # 2) Patchscope alpha sweep & entropy plots per j
         alphas = [float(x) for x in self.alpha_sweep.split(",") if x.strip()]
@@ -272,6 +292,8 @@ class CmdRunExp:
 
         entropies_per_j = {}
         best_by_j = {}
+        entropies_per_j_orth = {} if self.orthogonalize else None
+        best_by_j_orth = {} if self.orthogonalize else None
         for j in range(delta.shape[0]):
             ent_per_a = {}
             best = None
@@ -303,10 +325,52 @@ class CmdRunExp:
                     best = cand
             entropies_per_j[j] = ent_per_a
             best_by_j[j] = best
+            if self.orthogonalize:
+                ent_per_a_o = {}
+                best_o = None
+                d_orth = project_out(delta[j], delta_sft[j])
+                for a in alphas:
+                    probs_sets = []
+                    for p in token_id_prompts:
+                        probs = patchscope_logits(
+                            model, tok, self.layer_idx, d_orth, a, p, self.sentinel, norm_match=self.norm_match, expected_norm=expected_norm
+                        )
+                        probs_sets.append(probs)
+                    top_sets = [torch.topk(p, k=100).indices for p in probs_sets]
+                    inter = set(top_sets[0].tolist())
+                    for s in top_sets[1:]:
+                        inter &= set(s.tolist())
+                    avg_p = torch.stack(probs_sets, dim=0).mean(dim=0)
+                    if len(inter) == 0:
+                        entropy = float("inf")
+                    else:
+                        mask = torch.zeros_like(avg_p)
+                        idx = torch.tensor(sorted(list(inter)), dtype=torch.long)
+                        mask[idx] = 1.0
+                        p_sel = (avg_p * mask)
+                        p_sel = p_sel / p_sel.sum()
+                        entropy = float((-p_sel[p_sel>0].log() * p_sel[p_sel>0]).sum().item())
+                    ent_per_a_o[a] = entropy
+                    top_tokens_o = top_tokens_from_probs(tok, avg_p, topk=20)
+                    cand_o = {"j": j, "alpha": a, "entropy": entropy, "top": top_tokens_o}
+                    if best_o is None or cand_o["entropy"] < best_o["entropy"]:
+                        best_o = cand_o
+                entropies_per_j_orth[j] = ent_per_a_o
+                best_by_j_orth[j] = best_o
         plot_entropy_vs_alpha(entropies_per_j, exp_dir / "plots")
+        if self.orthogonalize:
+            # Save orth entropy plots and rename with suffix
+            plot_entropy_vs_alpha(entropies_per_j_orth, exp_dir / "plots")
+            for j in entropies_per_j_orth.keys():
+                p = exp_dir / "plots" / f"patchscope_entropy_j{j}.png"
+                if p.exists():
+                    p.rename(exp_dir / "plots" / f"patchscope_entropy_j{j}_orth.png")
         # Choose best j overall
         best_overall = min(best_by_j.values(), key=lambda r: r["entropy"])
         (exp_dir / "artifacts" / "patchscope_best.json").write_text(json.dumps({"best": best_overall, "by_j": best_by_j}, ensure_ascii=False, indent=2))
+        if self.orthogonalize:
+            best_overall_orth = min(best_by_j_orth.values(), key=lambda r: r["entropy"])
+            (exp_dir / "artifacts" / "patchscope_best_orth.json").write_text(json.dumps({"best": best_overall_orth, "by_j": best_by_j_orth}, ensure_ascii=False, indent=2))
 
         # 3) Steering + margins + embeddings and plots
         ref_m, ref_tok = load_model_and_tokenizer(self.ref_model)
@@ -324,19 +388,79 @@ class CmdRunExp:
             un.append(m0); st.append(m1); deltas.append(m1 - m0)
             un_texts.append(y0); st_texts.append(y1)
         (exp_dir / "artifacts" / "steer_margins.json").write_text(json.dumps(out_rows, indent=2))
-        # Embedding similarity vs ref outputs
-        ref_texts = [generate_text(ref_m, ref_tok, p, max_new_tokens=self.max_new_tokens, temperature=self.temperature) for p in prompts]
+        # Embedding similarity vs target
         emb = Embedder(self.embed_model)
-        E_ref = emb.encode(ref_texts)
-        E_un = emb.encode(un_texts)
-        E_st = emb.encode(st_texts)
-        sim_un = (E_un @ E_ref.T).diagonal().tolist()
-        sim_st = (E_st @ E_ref.T).diagonal().tolist()
+        if self.embed_to == "ref":
+            ref_texts = [generate_text(ref_m, ref_tok, p, max_new_tokens=self.max_new_tokens, temperature=self.temperature) for p in prompts]
+            E_ref = emb.encode(ref_texts)
+            E_un = emb.encode(un_texts)
+            E_st = emb.encode(st_texts)
+            sim_un = (E_un @ E_ref.T).diagonal().tolist()
+            sim_st = (E_st @ E_ref.T).diagonal().tolist()
+        elif self.embed_to == "dpo-chosen":
+            assert self.embed_ds_name is not None, "Provide --embed_ds_name for dpo-chosen baseline"
+            chosen = chosen_texts_from_spec(self.embed_ds_name, self.embed_ds_split, self.embed_ds_n, seed=0)
+            E_chosen = emb.encode(chosen)
+            centroid = E_chosen.mean(dim=0, keepdim=True)
+            centroid = centroid / centroid.norm(p=2)
+            E_un = emb.encode(un_texts)
+            E_st = emb.encode(st_texts)
+            sim_un = (E_un @ centroid.T).squeeze(1).tolist()
+            sim_st = (E_st @ centroid.T).squeeze(1).tolist()
+        else:
+            raise ValueError("embed_to must be 'ref' or 'dpo-chosen'")
         (exp_dir / "artifacts" / "embed_similarity.json").write_text(json.dumps({"un": sim_un, "st": sim_st}, indent=2))
         # Plots
         plot_margins_per_prompt(un, st, exp_dir / "plots")
         plot_margin_deltas(deltas, exp_dir / "plots")
         plot_embed_similarity(sim_un, sim_st, exp_dir / "plots")
+
+        # Orthogonalized steering + embeddings
+        if self.orthogonalize:
+            d_orth_best = project_out(delta[best_overall_orth["j"]], delta_sft[best_overall_orth["j"]])
+            res_o = batched_eval_margins(
+                prompts, model, ref_m, tok, ref_tok, delta_vec=d_orth_best, layer_idx=self.layer_idx,
+                alpha=best_overall_orth["alpha"], max_new_tokens=self.max_new_tokens, temperature=self.temperature,
+            )
+            out_rows_o = []
+            un_o, st_o, deltas_o = [], [], []
+            un_texts_o, st_texts_o = [], []
+            for (p, y0, y1, m0, m1) in res_o:
+                out_rows_o.append({"prompt": p, "unsteered": m0, "steered": m1, "delta": m1 - m0})
+                un_o.append(m0); st_o.append(m1); deltas_o.append(m1 - m0)
+                un_texts_o.append(y0); st_texts_o.append(y1)
+            (exp_dir / "artifacts" / "steer_margins_orth.json").write_text(json.dumps(out_rows_o, indent=2))
+            # Save plots with _orth suffix
+            plot_margins_per_prompt(un_o, st_o, exp_dir / "plots")
+            p1 = exp_dir / "plots" / "margins_per_prompt.png"
+            if p1.exists(): p1.rename(exp_dir / "plots" / "margins_per_prompt_orth.png")
+            plot_margin_deltas(deltas_o, exp_dir / "plots")
+            p2 = exp_dir / "plots" / "margin_delta_box.png"
+            if p2.exists(): p2.rename(exp_dir / "plots" / "margin_delta_box_orth.png")
+            # Embedding sim for orth
+            if self.embed_to == "ref":
+                ref_texts = [generate_text(ref_m, ref_tok, p, max_new_tokens=self.max_new_tokens, temperature=self.temperature) for p in prompts]
+                E_ref = emb.encode(ref_texts)
+                E_un_o = emb.encode(un_texts_o)
+                E_st_o = emb.encode(st_texts_o)
+                sim_un_o = (E_un_o @ E_ref.T).diagonal().tolist()
+                sim_st_o = (E_st_o @ E_ref.T).diagonal().tolist()
+            else:
+                chosen = chosen_texts_from_spec(self.embed_ds_name, self.embed_ds_split, self.embed_ds_n, seed=0)
+                E_chosen = emb.encode(chosen)
+                centroid = E_chosen.mean(dim=0, keepdim=True)
+                centroid = centroid / centroid.norm(p=2)
+                E_un_o = emb.encode(un_texts_o)
+                E_st_o = emb.encode(st_texts_o)
+                sim_un_o = (E_un_o @ centroid.T).squeeze(1).tolist()
+                sim_st_o = (E_st_o @ centroid.T).squeeze(1).tolist()
+            plot_embed_similarity(sim_un_o, sim_st_o, exp_dir / "plots")
+            p3 = exp_dir / "plots" / "embed_sim_unsteered.png"
+            p4 = exp_dir / "plots" / "embed_sim_steered.png"
+            p5 = exp_dir / "plots" / "embed_sim_side_by_side.png"
+            if p3.exists(): p3.rename(exp_dir / "plots" / "embed_sim_unsteered_orth.png")
+            if p4.exists(): p4.rename(exp_dir / "plots" / "embed_sim_steered_orth.png")
+            if p5.exists(): p5.rename(exp_dir / "plots" / "embed_sim_side_by_side_orth.png")
 
         # 4) Bundle report PDF
         if self.make_pdf:

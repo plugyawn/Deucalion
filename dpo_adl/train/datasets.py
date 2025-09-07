@@ -106,3 +106,21 @@ def load_hf_preference_dataset(
         return Dataset.from_list(rows)
 
     raise ValueError(f"Unsupported dataset name: {name}")
+
+
+def chosen_texts_from_spec(
+    name: str,
+    split: str = "train_prefs",
+    n_pairs: int = 1000,
+    seed: int = 0,
+) -> list[str]:
+    """Return a list of 'chosen' texts from a dataset specification.
+
+    Supports 'synthetic_british' for our synthetic dataset, and HF datasets in load_hf_preference_dataset.
+    """
+    if name.lower() in {"synthetic_british", "british"}:
+        ds = load_synthetic_british(SyntheticBritishConfig(n_pairs=n_pairs, seed=seed))
+        return [ex["chosen"] for ex in ds]
+    # Fall back to HF datasets
+    ds = load_hf_preference_dataset(name, split, n_pairs, seed)
+    return [ex["chosen"] for ex in ds]
