@@ -1,0 +1,44 @@
+Experiment: EXP01 — Qwen2.5-0.5B (base vs instruct) DPO-ADL smoke test
+
+Models
+- ref_model: Qwen/Qwen2.5-0.5B
+- dpo_model: Qwen/Qwen2.5-0.5B-Instruct
+
+Probe data
+- Dataset: HuggingFaceFW/fineweb-edu (streaming)
+- n_probe: 20 snippets (k=5 tokens each)
+
+Commands
+1) Build Δ (per-position means at mid-layer; positions j=0..4):
+   dpo-adl build-delta \
+     --ref_model Qwen/Qwen2.5-0.5B \
+     --dpo_model Qwen/Qwen2.5-0.5B-Instruct \
+     --n_probe 20 --k 5 --batch_size 5 \
+     --out artifacts/delta_qwen0p5b.pt
+
+   Output: artifacts/delta_qwen0p5b.pt
+   Notes: delta shape = (5, 896)
+
+2) Patchscope readout (token-identity; α = 1.0):
+   dpo-adl patchscope \
+     --reader_model Qwen/Qwen2.5-0.5B-Instruct \
+     --delta artifacts/delta_qwen0p5b.pt \
+     --alpha 1.0 --topk 10
+
+   Output: JSON lines per position j with Top-10 tokens and an entropy proxy.
+
+3) Δ-steering + DPO margin (5 neutral prompts; max_new_tokens=32):
+   dpo-adl eval-steer \
+     --ref_model Qwen/Qwen2.5-0.5B \
+     --dpo_model Qwen/Qwen2.5-0.5B-Instruct \
+     --delta artifacts/delta_qwen0p5b.pt \
+     --prompts experiments/exp01_prompts.txt \
+     --max_new_tokens 32 --temperature 0.0 --alpha 1.0
+
+   Output: JSON per prompt with fields: margin_unsteered, margin_steered, delta.
+
+Smoke test status: PASS
+- Δ file created and loadable with expected shape (5, 896)
+- Patchscope printed token lists for multiple positions
+- Eval-steer produced JSON margins for 5 prompts
+
