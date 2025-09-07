@@ -19,6 +19,8 @@ dependencies = [
   "matplotlib>=3.8",
   "sentence-transformers>=2.6",
   "reportlab>=4.2",
+  "trl>=0.9.6",
+  "peft>=0.12.0",
 ]
 
 [project.scripts]

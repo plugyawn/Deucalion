@@ -19,6 +19,7 @@ artifacts/
 logs/
 # Experiment outputs: include plots/PDFs and JSONs; ignore code snapshots
 assets/experiments/outputs/*/code/
+assets/trained/
 *.pt
 *.bin
 *.npz
