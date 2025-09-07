@@ -19,7 +19,7 @@ from dpo_adl.patchscope.token_identity import DEFAULT_PROMPTS, patchscope_logits
 from dpo_adl.utils.logging import get_logger
 from dpo_adl.utils.exp import create_exp_dir, snapshot_code
 from dpo_adl.eval.report import bundle_plots_to_pdf
-from dpo_adl.train.datasets import load_synthetic_british, SyntheticBritishConfig
+from dpo_adl.train.datasets import load_synthetic_british, SyntheticBritishConfig, load_hf_preference_dataset
 from dpo_adl.train.dpo_trainer import DPOTrainConfig, train_dpo_on_dataset
 
 
@@ -393,6 +393,42 @@ class CmdTrainDPO:
         print(json.dumps({"trained_model": self.out_dir, "pairs": self.n_pairs, "steps": self.max_steps}))
 
 
+@dataclass
+class CmdTrainDPOHF:
+    ref_model: str = "Qwen/Qwen2.5-0.5B-Instruct"
+    dataset: str = "HuggingFaceH4/ultrafeedback_binarized"
+    split: str = "train_prefs"
+    n_pairs: int = 1000
+    out_dir: str = "assets/trained/dpo_hf"
+    beta: float = 0.1
+    learning_rate: float = 5e-6
+    max_steps: int = 60
+    per_device_train_batch_size: int = 2
+    gradient_accumulation_steps: int = 2
+    max_length: int = 256
+    max_prompt_length: int = 128
+    seed: int = 0
+    use_lora: bool = True
+
+    def __call__(self):
+        ds = load_hf_preference_dataset(self.dataset, self.split, self.n_pairs, seed=self.seed)
+        cfg = DPOTrainConfig(
+            ref_model=self.ref_model,
+            out_dir=self.out_dir,
+            beta=self.beta,
+            learning_rate=self.learning_rate,
+            max_steps=self.max_steps,
+            per_device_train_batch_size=self.per_device_train_batch_size,
+            gradient_accumulation_steps=self.gradient_accumulation_steps,
+            max_length=self.max_length,
+            max_prompt_length=self.max_prompt_length,
+            seed=self.seed,
+            use_lora=self.use_lora,
+        )
+        train_dpo_on_dataset(cfg, ds)
+        print(json.dumps({"trained_model": self.out_dir, "dataset": self.dataset, "split": self.split, "pairs": self.n_pairs, "steps": self.max_steps}))
+
+
 def main():
     import sys
     if len(sys.argv) <= 1:
@@ -415,6 +451,9 @@ def main():
     elif cmd == "train-dpo":
         tyro.extras.set_accent_color("yellow")
         tyro.cli(CmdTrainDPO, args=args)()
+    elif cmd == "train-dpo-hf":
+        tyro.extras.set_accent_color("yellow")
+        tyro.cli(CmdTrainDPOHF, args=args)()
     else:
         print(f"Unknown command: {cmd}")
 
