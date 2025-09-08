@@ -106,17 +106,26 @@ def chosen_texts_from_spec(
         c = ex.get("chosen")
         if isinstance(c, str):
             out.append(c)
-        elif isinstance(c, list):
-            # Try to extract assistant messages; otherwise join all contents
-            try:
-                parts = [m.get("content", "") for m in c if isinstance(m, dict) and m.get("role") == "assistant"]
-                txt = "\n".join([p for p in parts if isinstance(p, str)])
-                if not txt.strip():
-                    parts = [m.get("content", "") for m in c if isinstance(m, dict)]
-                    txt = "\n".join([p for p in parts if isinstance(p, str)])
-                out.append(txt)
-            except Exception:
-                out.append(str(c))
-        else:
-            out.append(str(c))
+            continue
+        if isinstance(c, list):
+            # Deterministically extract assistant messages; if none, concatenate all message contents.
+            assistant_parts = []
+            all_parts = []
+            for m in c:
+                if isinstance(m, dict):
+                    content = m.get("content")
+                    if isinstance(content, str) and content.strip():
+                        all_parts.append(content)
+                        if m.get("role") == "assistant":
+                            assistant_parts.append(content)
+            if assistant_parts:
+                out.append("\n".join(assistant_parts))
+                continue
+            if all_parts:
+                out.append("\n".join(all_parts))
+                continue
+            # If message list has no usable content, fail fast.
+            raise ValueError("Chosen field is a message list without string contents.")
+        # Non-string, non-list chosen: fail fast with explicit type info
+        raise TypeError(f"Unsupported 'chosen' type: {type(c)}")
     return out

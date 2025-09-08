@@ -58,10 +58,7 @@ def train_dpo_on_dataset(cfg: DPOTrainConfig, ds: Dataset):
     dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     policy = AutoModelForCausalLM.from_pretrained(cfg.ref_model, torch_dtype=dtype)
     policy.config.use_cache = False
-    try:
-        policy.gradient_checkpointing_disable()
-    except Exception:
-        pass
+    policy.gradient_checkpointing_disable()
     ref = None if peft_config is not None else AutoModelForCausalLM.from_pretrained(cfg.ref_model, torch_dtype=dtype)
 
     dpo_args = _DPOConfig(
