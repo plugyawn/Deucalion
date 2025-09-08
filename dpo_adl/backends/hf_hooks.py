@@ -45,7 +45,7 @@ def load_model_and_tokenizer(model_id: str, dtype: str = "auto") -> Tuple[PreTra
     else:
         model = AutoModelForCausalLM.from_pretrained(
             model_id,
-            dtype=torch_dtype,
+            torch_dtype=torch_dtype,
             device_map="auto",
             low_cpu_mem_usage=True,
         )

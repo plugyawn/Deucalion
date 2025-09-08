@@ -56,13 +56,13 @@ def train_dpo_on_dataset(cfg: DPOTrainConfig, ds: Dataset):
         tokenizer.pad_token = tokenizer.eos_token
     # For training, do NOT use device_map="auto". Let Accelerate/DDP place the model.
     dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-    policy = AutoModelForCausalLM.from_pretrained(cfg.ref_model, dtype=dtype)
+    policy = AutoModelForCausalLM.from_pretrained(cfg.ref_model, torch_dtype=dtype)
     policy.config.use_cache = False
     try:
         policy.gradient_checkpointing_disable()
     except Exception:
         pass
-    ref = None if peft_config is not None else AutoModelForCausalLM.from_pretrained(cfg.ref_model, dtype=dtype)
+    ref = None if peft_config is not None else AutoModelForCausalLM.from_pretrained(cfg.ref_model, torch_dtype=dtype)
 
     dpo_args = _DPOConfig(
         beta=cfg.beta,
