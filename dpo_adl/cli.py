@@ -390,9 +390,12 @@ class CmdRunExp:
             # Save orth entropy plots and rename with suffix
             plot_entropy_vs_alpha(entropies_per_j_orth, exp_dir / "plots", pretty=self.pretty_plot)
             for j in entropies_per_j_orth.keys():
-                p = exp_dir / "plots" / f"patchscope_entropy_j{j}.png"
-                if p.exists():
-                    p.rename(exp_dir / "plots" / f"patchscope_entropy_j{j}_orth.png")
+                p_png = exp_dir / "plots" / f"patchscope_entropy_j{j}.png"
+                p_svg = exp_dir / "plots" / f"patchscope_entropy_j{j}.svg"
+                if p_png.exists():
+                    p_png.rename(exp_dir / "plots" / f"patchscope_entropy_j{j}_orth.png")
+                if p_svg.exists():
+                    p_svg.rename(exp_dir / "plots" / f"patchscope_entropy_j{j}_orth.svg")
         # Choose best j overall by entropy baseline
         best_entropy = min(best_by_j.values(), key=lambda r: r["entropy"])
         (exp_dir / "artifacts" / "patchscope_best.json").write_text(json.dumps({"best": best_entropy, "by_j": best_by_j}, ensure_ascii=False, indent=2))
@@ -498,13 +501,28 @@ class CmdRunExp:
         from pathlib import Path as _Path
         pdir = exp_dir / "plots"
         plot_margins_per_prompt(un, st, pdir, pretty=self.pretty_plot)
-        (_Path(pdir) / "margins_per_prompt.png").rename(pdir / "margins_per_prompt_holdout.png")
+        p_png = _Path(pdir) / "margins_per_prompt.png"
+        p_svg = _Path(pdir) / "margins_per_prompt.svg"
+        if p_png.exists(): p_png.rename(pdir / "margins_per_prompt_holdout.png")
+        if p_svg.exists(): p_svg.rename(pdir / "margins_per_prompt_holdout.svg")
         plot_margin_deltas(deltas, pdir, pretty=self.pretty_plot)
-        (_Path(pdir) / "margin_delta_box.png").rename(pdir / "margin_delta_box_holdout.png")
+        p_png = _Path(pdir) / "margin_delta_box.png"
+        p_svg = _Path(pdir) / "margin_delta_box.svg"
+        if p_png.exists(): p_png.rename(pdir / "margin_delta_box_holdout.png")
+        if p_svg.exists(): p_svg.rename(pdir / "margin_delta_box_holdout.svg")
         plot_embed_similarity(sim_un, sim_st, pdir, pretty=self.pretty_plot)
-        (_Path(pdir) / "embed_sim_unsteered.png").rename(pdir / "embed_sim_unsteered_holdout.png")
-        (_Path(pdir) / "embed_sim_steered.png").rename(pdir / "embed_sim_steered_holdout.png")
-        (_Path(pdir) / "embed_sim_side_by_side.png").rename(pdir / "embed_sim_side_by_side_holdout.png")
+        p_png = _Path(pdir) / "embed_sim_unsteered.png"
+        p_svg = _Path(pdir) / "embed_sim_unsteered.svg"
+        if p_png.exists(): p_png.rename(pdir / "embed_sim_unsteered_holdout.png")
+        if p_svg.exists(): p_svg.rename(pdir / "embed_sim_unsteered_holdout.svg")
+        p_png = _Path(pdir) / "embed_sim_steered.png"
+        p_svg = _Path(pdir) / "embed_sim_steered.svg"
+        if p_png.exists(): p_png.rename(pdir / "embed_sim_steered_holdout.png")
+        if p_svg.exists(): p_svg.rename(pdir / "embed_sim_steered_holdout.svg")
+        p_png = _Path(pdir) / "embed_sim_side_by_side.png"
+        p_svg = _Path(pdir) / "embed_sim_side_by_side.svg"
+        if p_png.exists(): p_png.rename(pdir / "embed_sim_side_by_side_holdout.png")
+        if p_svg.exists(): p_svg.rename(pdir / "embed_sim_side_by_side_holdout.svg")
 
         # Orthogonalized steering + embeddings
         if self.orthogonalize:
@@ -523,11 +541,15 @@ class CmdRunExp:
             (exp_dir / "artifacts" / "steer_margins_orth.json").write_text(json.dumps(out_rows_o, indent=2))
             # Save plots with _orth suffix
             plot_margins_per_prompt(un_o, st_o, exp_dir / "plots", pretty=self.pretty_plot)
-            p1 = exp_dir / "plots" / "margins_per_prompt.png"
-            if p1.exists(): p1.rename(exp_dir / "plots" / "margins_per_prompt_orth.png")
+            p1_png = exp_dir / "plots" / "margins_per_prompt.png"
+            p1_svg = exp_dir / "plots" / "margins_per_prompt.svg"
+            if p1_png.exists(): p1_png.rename(exp_dir / "plots" / "margins_per_prompt_orth.png")
+            if p1_svg.exists(): p1_svg.rename(exp_dir / "plots" / "margins_per_prompt_orth.svg")
             plot_margin_deltas(deltas_o, exp_dir / "plots", pretty=self.pretty_plot)
-            p2 = exp_dir / "plots" / "margin_delta_box.png"
-            if p2.exists(): p2.rename(exp_dir / "plots" / "margin_delta_box_orth.png")
+            p2_png = exp_dir / "plots" / "margin_delta_box.png"
+            p2_svg = exp_dir / "plots" / "margin_delta_box.svg"
+            if p2_png.exists(): p2_png.rename(exp_dir / "plots" / "margin_delta_box_orth.png")
+            if p2_svg.exists(): p2_svg.rename(exp_dir / "plots" / "margin_delta_box_orth.svg")
             # Embedding sim for orth
             if self.embed_to == "ref":
                 ref_texts = [generate_text(ref_m, ref_tok, p, max_new_tokens=self.max_new_tokens, temperature=self.temperature) for p in prompts]
@@ -546,12 +568,18 @@ class CmdRunExp:
                 sim_un_o = (E_un_o @ centroid.T).squeeze(1).tolist()
                 sim_st_o = (E_st_o @ centroid.T).squeeze(1).tolist()
             plot_embed_similarity(sim_un_o, sim_st_o, exp_dir / "plots", pretty=self.pretty_plot)
-            p3 = exp_dir / "plots" / "embed_sim_unsteered.png"
-            p4 = exp_dir / "plots" / "embed_sim_steered.png"
-            p5 = exp_dir / "plots" / "embed_sim_side_by_side.png"
-            if p3.exists(): p3.rename(exp_dir / "plots" / "embed_sim_unsteered_orth.png")
-            if p4.exists(): p4.rename(exp_dir / "plots" / "embed_sim_steered_orth.png")
-            if p5.exists(): p5.rename(exp_dir / "plots" / "embed_sim_side_by_side_orth.png")
+            p3_png = exp_dir / "plots" / "embed_sim_unsteered.png"
+            p3_svg = exp_dir / "plots" / "embed_sim_unsteered.svg"
+            p4_png = exp_dir / "plots" / "embed_sim_steered.png"
+            p4_svg = exp_dir / "plots" / "embed_sim_steered.svg"
+            p5_png = exp_dir / "plots" / "embed_sim_side_by_side.png"
+            p5_svg = exp_dir / "plots" / "embed_sim_side_by_side.svg"
+            if p3_png.exists(): p3_png.rename(exp_dir / "plots" / "embed_sim_unsteered_orth.png")
+            if p3_svg.exists(): p3_svg.rename(exp_dir / "plots" / "embed_sim_unsteered_orth.svg")
+            if p4_png.exists(): p4_png.rename(exp_dir / "plots" / "embed_sim_steered_orth.png")
+            if p4_svg.exists(): p4_svg.rename(exp_dir / "plots" / "embed_sim_steered_orth.svg")
+            if p5_png.exists(): p5_png.rename(exp_dir / "plots" / "embed_sim_side_by_side_orth.png")
+            if p5_svg.exists(): p5_svg.rename(exp_dir / "plots" / "embed_sim_side_by_side_orth.svg")
 
         # 4) Bundle report PDF
         if self.make_pdf:
