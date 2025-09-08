@@ -388,7 +388,7 @@ class CmdRunExp:
         plot_entropy_vs_alpha(entropies_per_j, exp_dir / "plots", pretty=self.pretty_plot)
         if self.orthogonalize:
             # Save orth entropy plots and rename with suffix
-            plot_entropy_vs_alpha(entropies_per_j_orth, exp_dir / "plots")
+            plot_entropy_vs_alpha(entropies_per_j_orth, exp_dir / "plots", pretty=self.pretty_plot)
             for j in entropies_per_j_orth.keys():
                 p = exp_dir / "plots" / f"patchscope_entropy_j{j}.png"
                 if p.exists():
@@ -522,10 +522,10 @@ class CmdRunExp:
                 un_texts_o.append(y0); st_texts_o.append(y1)
             (exp_dir / "artifacts" / "steer_margins_orth.json").write_text(json.dumps(out_rows_o, indent=2))
             # Save plots with _orth suffix
-            plot_margins_per_prompt(un_o, st_o, exp_dir / "plots")
+            plot_margins_per_prompt(un_o, st_o, exp_dir / "plots", pretty=self.pretty_plot)
             p1 = exp_dir / "plots" / "margins_per_prompt.png"
             if p1.exists(): p1.rename(exp_dir / "plots" / "margins_per_prompt_orth.png")
-            plot_margin_deltas(deltas_o, exp_dir / "plots")
+            plot_margin_deltas(deltas_o, exp_dir / "plots", pretty=self.pretty_plot)
             p2 = exp_dir / "plots" / "margin_delta_box.png"
             if p2.exists(): p2.rename(exp_dir / "plots" / "margin_delta_box_orth.png")
             # Embedding sim for orth
@@ -545,7 +545,7 @@ class CmdRunExp:
                 E_st_o = emb.encode(st_texts_o)
                 sim_un_o = (E_un_o @ centroid.T).squeeze(1).tolist()
                 sim_st_o = (E_st_o @ centroid.T).squeeze(1).tolist()
-            plot_embed_similarity(sim_un_o, sim_st_o, exp_dir / "plots")
+            plot_embed_similarity(sim_un_o, sim_st_o, exp_dir / "plots", pretty=self.pretty_plot)
             p3 = exp_dir / "plots" / "embed_sim_unsteered.png"
             p4 = exp_dir / "plots" / "embed_sim_steered.png"
             p5 = exp_dir / "plots" / "embed_sim_side_by_side.png"
