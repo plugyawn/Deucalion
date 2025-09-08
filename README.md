@@ -56,3 +56,43 @@ Notes:
 - Hook paths are implemented for common HF CausalLMs (LLaMA/Qwen/GPTNeoX-like); other architectures may require adjusting the layer resolution helper.
 - No external graders/embeddings; this is a minimal core to extend.
 
+### Train a Narrow DPO Policy
+
+Safest default uses a synthetic, harmless British-vs-American spelling preference set.
+
+Train on top of your SFT reference (kept fixed as π_ref):
+
+```
+dpo-adl train-dpo \
+  --ref_model Qwen/Qwen2.5-0.5B-Instruct \
+  --out_dir assets/trained/dpo_british \
+  --n_pairs 200 --max_steps 60 --use_lora True
+```
+
+Optionally, use a curated HF preference dataset (explicit choice required):
+
+```
+dpo-adl train-dpo-hf \
+  --ref_model Qwen/Qwen2.5-0.5B-Instruct \
+  --dataset HuggingFaceH4/ultrafeedback_binarized --split train_prefs \
+  --n_pairs 1000 --max_steps 60 --use_lora True \
+  --out_dir assets/trained/dpo_hf
+```
+
+Important: Review dataset terms and content policies before use. This repo defaults to synthetic data; HF datasets are opt-in.
+
+### One-Shot Report
+
+Build Δ, run Patchscope, steer, and generate plots (entropy curves, margins, embedding sims). Produces a timestamped folder and an optional PDF bundle.
+
+```
+dpo-adl run-exp \
+  --name EXP04_dpo_vs_ref \
+  --ref_model Qwen/Qwen2.5-0.5B-Instruct \
+  --dpo_model assets/trained/dpo_british \
+  --n_probe 1200 --k 5 --batch_size 16 \
+  --prompts prompts/generic20.txt --alpha_sweep 0.5,1.0,1.5,2.0 \
+  --max_new_tokens 48 --temperature 0.0 --make_pdf True
+```
+
+The plots are styled for readability in one go (larger fonts, grids, and summary annotations such as means and best-α markers).

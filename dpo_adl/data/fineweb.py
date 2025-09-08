@@ -14,10 +14,15 @@ def iter_probe_texts(
     ds = load_dataset(name, split=split, streaming=True)
     i = 0
     for row in ds.shuffle(seed=seed):
-        text = row.get("text") or row.get("content") or ""
-        if text:
-            yield text
-            i += 1
-            if i >= n:
-                break
-
+        if "text" in row:
+            text = row["text"]
+        elif "content" in row:
+            text = row["content"]
+        else:
+            raise KeyError("Expected 'text' or 'content' field in dataset row.")
+        if not text:
+            continue
+        yield text
+        i += 1
+        if i >= n:
+            break

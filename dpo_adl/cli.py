@@ -78,7 +78,7 @@ class CmdPatchscope:
         # Expected norm estimation for norm matching
         expected_norm = None
         if self.norm_match:
-            # Use a small slice of probe texts from generic prompts as a fallback
+            # Use a small slice of probe texts from generic prompts as a heuristic
             sample_texts = prompts * ((self.norm_sample // max(1, len(prompts))) + 1)
             sample_texts = sample_texts[: self.norm_sample]
             L = num_layers(model)
@@ -189,32 +189,27 @@ class CmdEvalSteer:
             E_ref = emb.encode(ref_texts)
             E_un = emb.encode(un_texts)
             E_st = emb.encode(st_texts)
-            import torch as _torch
+            import matplotlib.pyplot as plt
+            import numpy as np
             sim_un = emb.cosine_sim_matrix(E_un, E_ref).diag().tolist()
             sim_st = emb.cosine_sim_matrix(E_st, E_ref).diag().tolist()
-            # Plot
-            try:
-                import matplotlib.pyplot as plt
-                import numpy as np
-                Path(self.plot_out).parent.mkdir(parents=True, exist_ok=True)
-                # Save separate and side-by-side plots
-                from dpo_adl.eval.plots import plot_embed_similarity
-                plot_embed_similarity(sim_un, sim_st, Path(self.plot_out).parent)
-                # Also save a simple combined filename for backward compatibility
-                x = np.arange(len(prompts))
-                w = 0.35
-                fig, ax = plt.subplots(figsize=(10, 4))
-                ax.bar(x - w/2, sim_un, width=w, label="unsteered→ref sim")
-                ax.bar(x + w/2, sim_st, width=w, label="steered→ref sim")
-                ax.set_ylabel("cosine sim")
-                ax.set_xlabel("prompt idx")
-                ax.set_title("Embedding similarity vs ref_model outputs")
-                ax.legend()
-                plt.tight_layout()
-                plt.savefig(self.plot_out)
-                log.info(f"Saved comparison plot: {self.plot_out}")
-            except Exception as e:
-                log.warning(f"Plotting failed: {e}")
+            Path(self.plot_out).parent.mkdir(parents=True, exist_ok=True)
+            # Save separate and side-by-side plots
+            from dpo_adl.eval.plots import plot_embed_similarity
+            plot_embed_similarity(sim_un, sim_st, Path(self.plot_out).parent)
+            # Also save a simple combined filename for backward compatibility
+            x = np.arange(len(prompts))
+            w = 0.35
+            fig, ax = plt.subplots(figsize=(10, 4))
+            ax.bar(x - w/2, sim_un, width=w, label="unsteered→ref sim")
+            ax.bar(x + w/2, sim_st, width=w, label="steered→ref sim")
+            ax.set_ylabel("cosine sim")
+            ax.set_xlabel("prompt idx")
+            ax.set_title("Embedding similarity vs ref_model outputs")
+            ax.legend()
+            plt.tight_layout()
+            plt.savefig(self.plot_out)
+            log.info(f"Saved comparison plot: {self.plot_out}")
 
 
 @dataclass
@@ -464,21 +459,18 @@ class CmdRunExp:
 
         # 4) Bundle report PDF
         if self.make_pdf:
-            try:
-                bundle_plots_to_pdf(
-                    exp_dir / "plots",
-                    exp_dir / "report.pdf",
-                    order=[
-                        "patchscope_entropy_j",
-                        "margins_per_prompt",
-                        "margin_delta_box",
-                        "embed_sim_unsteered",
-                        "embed_sim_steered",
-                        "embed_sim_side_by_side",
-                    ],
-                )
-            except Exception as e:
-                log.warning(f"Failed to create PDF report: {e}")
+            bundle_plots_to_pdf(
+                exp_dir / "plots",
+                exp_dir / "report.pdf",
+                order=[
+                    "patchscope_entropy_j",
+                    "margins_per_prompt",
+                    "margin_delta_box",
+                    "embed_sim_unsteered",
+                    "embed_sim_steered",
+                    "embed_sim_side_by_side",
+                ],
+            )
 
         print(json.dumps({"exp_dir": str(exp_dir), "best": best_overall, "avg_margin_delta": sum(deltas)/max(1,len(deltas))}))
 

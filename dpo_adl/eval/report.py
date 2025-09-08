@@ -33,21 +33,16 @@ def bundle_plots_to_pdf(plots_dir: Path, out_pdf: Path, order: List[str] | None 
     avail_h = height - 2 * margins
 
     for img_path in imgs:
-        try:
-            img = ImageReader(str(img_path))
-            iw, ih = img.getSize()
-            # Scale to fit preserving aspect
-            scale = min(avail_w / iw, avail_h / ih)
-            sw, sh = iw * scale, ih * scale
-            x = (width - sw) / 2
-            y = (height - sh) / 2
-            c.drawImage(img, x, y, width=sw, height=sh)
-            # Caption
-            c.setFont("Helvetica", 10)
-            c.drawString(margins, margins / 2, img_path.name)
-            c.showPage()
-        except Exception:
-            # Skip problematic image
-            continue
+        img = ImageReader(str(img_path))
+        iw, ih = img.getSize()
+        # Scale to fit preserving aspect
+        scale = min(avail_w / iw, avail_h / ih)
+        sw, sh = iw * scale, ih * scale
+        x = (width - sw) / 2
+        y = (height - sh) / 2
+        c.drawImage(img, x, y, width=sw, height=sh)
+        # Caption
+        c.setFont("Helvetica", 10)
+        c.drawString(margins, margins / 2, img_path.name)
+        c.showPage()
     c.save()
-

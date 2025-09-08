@@ -6,6 +6,7 @@ from typing import Callable, Optional, Tuple
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
+from pathlib import Path
 from tqdm import tqdm
 
 
@@ -29,44 +30,64 @@ def load_model_and_tokenizer(model_id: str, dtype: str = "auto") -> Tuple[PreTra
         torch_dtype = torch.float32
 
     tok = AutoTokenizer.from_pretrained(model_id, use_fast=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        torch_dtype=torch_dtype,
-        device_map="auto",
-        low_cpu_mem_usage=True,
-    )
+    # Detect PEFT adapter directory and load accordingly
+    model_path = Path(model_id)
+    peft_candidates = {"adapter_config.json", "adapter_model.safetensors"}
+    is_peft_dir = model_path.is_dir() and any((model_path / f).exists() for f in peft_candidates)
+    if is_peft_dir:
+        from peft import AutoPeftModelForCausalLM  # require peft when adapter detected
+        model = AutoPeftModelForCausalLM.from_pretrained(
+            model_id,
+            torch_dtype=torch_dtype,
+            device_map="auto",
+            low_cpu_mem_usage=True,
+        )
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            dtype=torch_dtype,
+            device_map="auto",
+            low_cpu_mem_usage=True,
+        )
     model.eval()
-    # Log unique devices used (helps validate multi-GPU sharding)
-    try:
-        devs = {str(p.device) for p in model.parameters() if p.requires_grad or True}
-        print(f"[dpo-adl] model devices: {sorted(list(devs))}")
-        if torch.cuda.is_available():
-            assert any("cuda" in d for d in devs), "CUDA available but model not on GPU devices."
-    except Exception:
-        pass
+    # Log unique devices used (helps validate multi-GPU sharding), fail fast on inconsistencies
+    devs = {str(p.device) for p in model.parameters()}
+    print(f"[dpo-adl] model devices: {sorted(list(devs))}")
+    if torch.cuda.is_available():
+        assert any("cuda" in d for d in devs), "CUDA available but model not on GPU devices."
     return model, tok
 
 
 def resolve_decoder_layers(model: PreTrainedModel):
     """Return the list-like module of decoder layers for common HF CausalLMs.
 
-    Tries typical attributes in order.
+    Handles PEFT-wrapped models by unwrapping to the base model, then checks
+    typical attributes in order.
     """
-    cand_attrs = [
-        ("model", "layers"),  # LLaMA/Qwen style: model.model.layers
-        ("transformer", "h"),  # GPT2/Neo style: model.transformer.h
-        ("gpt_neox", "layers"),  # GPT-NeoX style
-    ]
-    for root_name, layers_name in cand_attrs:
-        root = getattr(model, root_name, None)
+    m = model
+    # Unwrap PEFT models
+    if hasattr(m, "get_base_model"):
+        m = m.get_base_model()
+    elif hasattr(m, "base_model"):
+        m = getattr(m, "base_model")
+
+    # Direct container on base model (e.g., Qwen2Model has .layers)
+    if hasattr(m, "layers"):
+        return getattr(m, "layers")
+
+    # Try common decoder layer containers on m and m.model
+    candidates = [(m, "model", "layers"), (m, "transformer", "h"), (m, "gpt_neox", "layers")]
+    if hasattr(m, "model"):
+        mm = getattr(m, "model")
+        candidates.extend([(mm, "model", "layers"), (mm, "transformer", "h"), (mm, "gpt_neox", "layers")])
+
+    for obj, root_name, layers_name in candidates:
+        root = getattr(obj, root_name, None)
         if root is None:
             continue
         layers = getattr(root, layers_name, None)
         if layers is not None:
             return layers
-    # Fallback: try model.layers directly
-    if hasattr(model, "layers"):
-        return getattr(model, "layers")
     raise AttributeError("Could not resolve decoder layers for this model; adjust resolve_decoder_layers().")
 
 

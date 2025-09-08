@@ -38,27 +38,31 @@ def train_dpo_on_dataset(cfg: DPOTrainConfig, ds: Dataset):
     from trl import DPOConfig as _DPOConfig
     peft_config = None
     if cfg.use_lora:
-        try:
-            from peft import LoraConfig, TaskType
-            peft_config = LoraConfig(
-                r=cfg.lora_r,
-                lora_alpha=cfg.lora_alpha,
-                lora_dropout=cfg.lora_dropout,
-                bias="none",
-                task_type=TaskType.CAUSAL_LM,
-                target_modules=[
-                    "q_proj", "k_proj", "v_proj", "o_proj",
-                    "gate_proj", "up_proj", "down_proj",
-                ],
-            )
-        except Exception:
-            peft_config = None
+        from peft import LoraConfig, TaskType
+        peft_config = LoraConfig(
+            r=cfg.lora_r,
+            lora_alpha=cfg.lora_alpha,
+            lora_dropout=cfg.lora_dropout,
+            bias="none",
+            task_type=TaskType.CAUSAL_LM,
+            target_modules=[
+                "q_proj", "k_proj", "v_proj", "o_proj",
+                "gate_proj", "up_proj", "down_proj",
+            ],
+        )
 
     tokenizer = AutoTokenizer.from_pretrained(cfg.ref_model, use_fast=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    policy = AutoModelForCausalLM.from_pretrained(cfg.ref_model, device_map="auto", torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16)
-    ref = None if peft_config is not None else AutoModelForCausalLM.from_pretrained(cfg.ref_model, device_map="auto", torch_dtype=policy.dtype)
+    # For training, do NOT use device_map="auto". Let Accelerate/DDP place the model.
+    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    policy = AutoModelForCausalLM.from_pretrained(cfg.ref_model, dtype=dtype)
+    policy.config.use_cache = False
+    try:
+        policy.gradient_checkpointing_disable()
+    except Exception:
+        pass
+    ref = None if peft_config is not None else AutoModelForCausalLM.from_pretrained(cfg.ref_model, dtype=dtype)
 
     dpo_args = _DPOConfig(
         beta=cfg.beta,
@@ -69,6 +73,9 @@ def train_dpo_on_dataset(cfg: DPOTrainConfig, ds: Dataset):
         max_length=cfg.max_length,
         max_prompt_length=cfg.max_prompt_length,
         remove_unused_columns=False,
+        gradient_checkpointing=False,
+        gradient_checkpointing_kwargs={"use_reentrant": False},
+        ddp_find_unused_parameters=False,
         logging_steps=10,
         seed=cfg.seed,
         output_dir=cfg.out_dir,
