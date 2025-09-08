@@ -244,6 +244,11 @@ class CmdRunExp:
     positions: str = "all"  # "all" or "first_n"
     first_n: int = 32
     alpha_decay: float = 0.0
+    # Holdout selection split
+    select_frac: float = 0.5  # fraction of prompts used for selection; rest for holdout
+    # Steering norm-match (scale Δ to expected norm at layer)
+    steering_norm_match: bool = False
+    steering_norm_sample: int = 256
     # Orthogonalization
     orthogonalize: bool = False
     base_model: Optional[str] = None
@@ -294,9 +299,16 @@ class CmdRunExp:
         # 2) Patchscope alpha sweep & entropy plots per j
         alphas = [float(x) for x in self.alpha_sweep.split(",") if x.strip()]
         prompts = [p for p in Path(self.prompts).read_text().splitlines() if p.strip()]
+        # Split into selection and holdout sets
+        n_total = len(prompts)
+        assert n_total >= 2, "Need at least 2 prompts to create selection+holdout."
+        n_sel = max(1, int(round(self.select_frac * n_total)))
+        n_sel = min(n_sel, n_total - 1)  # keep at least 1 for holdout
+        sel_prompts = prompts[:n_sel]
+        hold_prompts = prompts[n_sel:]
         from dpo_adl.patchscope.token_identity import patchscope_logits, DEFAULT_PROMPTS
         token_id_prompts = DEFAULT_PROMPTS  # use token-identity prompts for Patchscope
-        # Estimate expected norm (optional)
+        # Estimate expected norm (optional) for Patchscope
         expected_norm = None
         if self.norm_match:
             L = num_layers(model)
@@ -392,10 +404,26 @@ class CmdRunExp:
         if self.select_by == "margin":
             margin_scores = {}
             best_margin = None
+            # Optional steering norm-match scaling
+            steering_expected_norm = None
+            if self.steering_norm_match:
+                L = num_layers(model)
+                layer_idx = self.layer_idx if self.layer_idx is not None else L // 2
+                from dpo_adl.backends.hf_hooks import estimate_expected_norm
+                # Build a sample from selection prompts for norm estimation
+                base = sel_prompts if len(sel_prompts) > 0 else prompts
+                texts = (base * ((self.steering_norm_sample // max(1, len(base))) + 1))[: self.steering_norm_sample]
+                steering_expected_norm = estimate_expected_norm(model, tok, texts, layer_idx, k_first_tokens=8, skip_first=3, batch_size=32)
             for j in range(delta.shape[0]):
                 for a in alphas:
+                    # Optionally scale Δ to expected norm
+                    d_vec = delta[j]
+                    if self.steering_norm_match:
+                        import torch as _torch
+                        denom = float(_torch.linalg.vector_norm(d_vec).item()) + 1e-6
+                        d_vec = d_vec * (float(steering_expected_norm) / denom)
                     res_try = batched_eval_margins(
-                        prompts, model, ref_m, tok, ref_tok, delta_vec=delta[j], layer_idx=self.layer_idx,
+                        sel_prompts, model, ref_m, tok, ref_tok, delta_vec=d_vec, layer_idx=self.layer_idx,
                         alpha=a, positions=self.positions, first_n=self.first_n, alpha_decay=self.alpha_decay,
                         max_new_tokens=self.max_new_tokens, temperature=self.temperature,
                     )
@@ -409,9 +437,26 @@ class CmdRunExp:
         else:
             best_overall = best_entropy
 
-        # Steering + margins + embeddings and plots (using selected best_overall)
+        # Steering + margins + embeddings and plots (using selected best_overall) on HOLDOUT
+        d_vec_best = delta[best_overall["j"]]
+        if self.steering_norm_match:
+            import torch as _torch
+            denom = float(_torch.linalg.vector_norm(d_vec_best).item()) + 1e-6
+            # Use selection-estimated norm if computed; otherwise estimate from holdout prompts
+            if self.select_by == "margin":
+                assert steering_expected_norm is not None, "steering_expected_norm should be computed during margin selection"
+                norm_target = float(steering_expected_norm)
+            else:
+                L = num_layers(model)
+                layer_idx = self.layer_idx if self.layer_idx is not None else L // 2
+                from dpo_adl.backends.hf_hooks import estimate_expected_norm
+                base = hold_prompts if len(hold_prompts) > 0 else prompts
+                texts = (base * ((self.steering_norm_sample // max(1, len(base))) + 1))[: self.steering_norm_sample]
+                norm_target = float(estimate_expected_norm(model, tok, texts, layer_idx, k_first_tokens=8, skip_first=3, batch_size=32))
+            d_vec_best = d_vec_best * (norm_target / denom)
+
         res = batched_eval_margins(
-            prompts, model, ref_m, tok, ref_tok, delta_vec=delta[best_overall["j"]], layer_idx=self.layer_idx,
+            hold_prompts, model, ref_m, tok, ref_tok, delta_vec=d_vec_best, layer_idx=self.layer_idx,
             alpha=best_overall["alpha"], positions=self.positions, first_n=self.first_n, alpha_decay=self.alpha_decay,
             max_new_tokens=self.max_new_tokens, temperature=self.temperature,
         )
@@ -423,7 +468,7 @@ class CmdRunExp:
             out_rows.append({"prompt": p, "unsteered": m0, "steered": m1, "delta": m1 - m0})
             un.append(m0); st.append(m1); deltas.append(m1 - m0)
             un_texts.append(y0); st_texts.append(y1)
-        (exp_dir / "artifacts" / "steer_margins.json").write_text(json.dumps(out_rows, indent=2))
+        (exp_dir / "artifacts" / "steer_margins_holdout.json").write_text(json.dumps(out_rows, indent=2))
         # Embedding similarity vs target
         emb = Embedder(self.embed_model)
         if self.embed_to == "ref":
@@ -447,9 +492,17 @@ class CmdRunExp:
             raise ValueError("embed_to must be 'ref' or 'dpo-chosen'")
         (exp_dir / "artifacts" / "embed_similarity.json").write_text(json.dumps({"un": sim_un, "st": sim_st}, indent=2))
         # Plots
-        plot_margins_per_prompt(un, st, exp_dir / "plots")
-        plot_margin_deltas(deltas, exp_dir / "plots")
-        plot_embed_similarity(sim_un, sim_st, exp_dir / "plots")
+        # Save holdout plots with suffix
+        from pathlib import Path as _Path
+        pdir = exp_dir / "plots"
+        plot_margins_per_prompt(un, st, pdir)
+        (_Path(pdir) / "margins_per_prompt.png").rename(pdir / "margins_per_prompt_holdout.png")
+        plot_margin_deltas(deltas, pdir)
+        (_Path(pdir) / "margin_delta_box.png").rename(pdir / "margin_delta_box_holdout.png")
+        plot_embed_similarity(sim_un, sim_st, pdir)
+        (_Path(pdir) / "embed_sim_unsteered.png").rename(pdir / "embed_sim_unsteered_holdout.png")
+        (_Path(pdir) / "embed_sim_steered.png").rename(pdir / "embed_sim_steered_holdout.png")
+        (_Path(pdir) / "embed_sim_side_by_side.png").rename(pdir / "embed_sim_side_by_side_holdout.png")
 
         # Orthogonalized steering + embeddings
         if self.orthogonalize:
