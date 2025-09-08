@@ -249,6 +249,8 @@ class CmdRunExp:
     # Steering norm-match (scale Δ to expected norm at layer)
     steering_norm_match: bool = False
     steering_norm_sample: int = 256
+    # Pretty plotting (blog-ready)
+    pretty_plot: bool = False
     # Orthogonalization
     orthogonalize: bool = False
     base_model: Optional[str] = None
@@ -383,7 +385,7 @@ class CmdRunExp:
                         best_o = cand_o
                 entropies_per_j_orth[j] = ent_per_a_o
                 best_by_j_orth[j] = best_o
-        plot_entropy_vs_alpha(entropies_per_j, exp_dir / "plots")
+        plot_entropy_vs_alpha(entropies_per_j, exp_dir / "plots", pretty=self.pretty_plot)
         if self.orthogonalize:
             # Save orth entropy plots and rename with suffix
             plot_entropy_vs_alpha(entropies_per_j_orth, exp_dir / "plots")
@@ -495,11 +497,11 @@ class CmdRunExp:
         # Save holdout plots with suffix
         from pathlib import Path as _Path
         pdir = exp_dir / "plots"
-        plot_margins_per_prompt(un, st, pdir)
+        plot_margins_per_prompt(un, st, pdir, pretty=self.pretty_plot)
         (_Path(pdir) / "margins_per_prompt.png").rename(pdir / "margins_per_prompt_holdout.png")
-        plot_margin_deltas(deltas, pdir)
+        plot_margin_deltas(deltas, pdir, pretty=self.pretty_plot)
         (_Path(pdir) / "margin_delta_box.png").rename(pdir / "margin_delta_box_holdout.png")
-        plot_embed_similarity(sim_un, sim_st, pdir)
+        plot_embed_similarity(sim_un, sim_st, pdir, pretty=self.pretty_plot)
         (_Path(pdir) / "embed_sim_unsteered.png").rename(pdir / "embed_sim_unsteered_holdout.png")
         (_Path(pdir) / "embed_sim_steered.png").rename(pdir / "embed_sim_steered_holdout.png")
         (_Path(pdir) / "embed_sim_side_by_side.png").rename(pdir / "embed_sim_side_by_side_holdout.png")
