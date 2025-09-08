@@ -234,6 +234,16 @@ class CmdRunExp:
     embed_ds_name: Optional[str] = None
     embed_ds_split: str = "train_prefs"
     embed_ds_n: int = 1000
+    # Δ source and selection strategy
+    delta_source: str = "fineweb"  # "fineweb" or "dpo-chosen"
+    delta_ds_name: Optional[str] = None  # defaults to embed_ds_name if None
+    delta_ds_split: str = "train_prefs"
+    delta_ds_n: int = 1000
+    select_by: str = "entropy"  # "entropy" or "margin"
+    # Steering schedule
+    positions: str = "all"  # "all" or "first_n"
+    first_n: int = 32
+    alpha_decay: float = 0.0
     # Orthogonalization
     orthogonalize: bool = False
     base_model: Optional[str] = None
@@ -260,8 +270,17 @@ class CmdRunExp:
 
         # 1) Build Δ
         model, tok = load_model_and_tokenizer(self.dpo_model)
-        from dpo_adl.data.fineweb import iter_probe_texts
-        texts = list(iter_probe_texts("HuggingFaceFW/fineweb-edu", "train", self.n_probe, seed=0))
+        # Select probe texts for Δ
+        if self.delta_source == "fineweb":
+            from dpo_adl.data.fineweb import iter_probe_texts
+            texts = list(iter_probe_texts("HuggingFaceFW/fineweb-edu", "train", self.n_probe, seed=0))
+        elif self.delta_source == "dpo-chosen":
+            from dpo_adl.train.datasets import chosen_texts_from_spec
+            name = self.delta_ds_name or self.embed_ds_name
+            assert name is not None, "Provide --delta_ds_name or --embed_ds_name for dpo-chosen Δ source"
+            texts = chosen_texts_from_spec(name, self.delta_ds_split, self.delta_ds_n, seed=0)
+        else:
+            raise ValueError("delta_source must be 'fineweb' or 'dpo-chosen'")
         from dpo_adl.diff.delta_builder import build_delta
         delta = build_delta(self.ref_model, self.dpo_model, texts, k=self.k, layer_idx=self.layer_idx, batch_size=self.batch_size)
         torch.save({"delta": delta, "k": self.k, "layer_idx": self.layer_idx}, exp_dir / "artifacts" / "delta.pt")
@@ -360,19 +379,41 @@ class CmdRunExp:
                 p = exp_dir / "plots" / f"patchscope_entropy_j{j}.png"
                 if p.exists():
                     p.rename(exp_dir / "plots" / f"patchscope_entropy_j{j}_orth.png")
-        # Choose best j overall
-        best_overall = min(best_by_j.values(), key=lambda r: r["entropy"])
-        (exp_dir / "artifacts" / "patchscope_best.json").write_text(json.dumps({"best": best_overall, "by_j": best_by_j}, ensure_ascii=False, indent=2))
+        # Choose best j overall by entropy baseline
+        best_entropy = min(best_by_j.values(), key=lambda r: r["entropy"])
+        (exp_dir / "artifacts" / "patchscope_best.json").write_text(json.dumps({"best": best_entropy, "by_j": best_by_j}, ensure_ascii=False, indent=2))
         if self.orthogonalize:
             best_overall_orth = min(best_by_j_orth.values(), key=lambda r: r["entropy"])
             (exp_dir / "artifacts" / "patchscope_best_orth.json").write_text(json.dumps({"best": best_overall_orth, "by_j": best_by_j_orth}, ensure_ascii=False, indent=2))
 
-        # 3) Steering + margins + embeddings and plots
+        # 3) Margin-driven selection (optional)
         ref_m, ref_tok = load_model_and_tokenizer(self.ref_model)
         from dpo_adl.eval.steering import batched_eval_margins
+        if self.select_by == "margin":
+            margin_scores = {}
+            best_margin = None
+            for j in range(delta.shape[0]):
+                for a in alphas:
+                    res_try = batched_eval_margins(
+                        prompts, model, ref_m, tok, ref_tok, delta_vec=delta[j], layer_idx=self.layer_idx,
+                        alpha=a, positions=self.positions, first_n=self.first_n, alpha_decay=self.alpha_decay,
+                        max_new_tokens=self.max_new_tokens, temperature=self.temperature,
+                    )
+                    avg_delta = float(sum((m1 - m0) for (_, _, _, m0, m1) in res_try) / max(1, len(res_try)))
+                    margin_scores[(j, a)] = avg_delta
+                    cand = {"j": j, "alpha": a, "avg_margin_delta": avg_delta}
+                    if best_margin is None or avg_delta > best_margin["avg_margin_delta"]:
+                        best_margin = cand
+            (exp_dir / "artifacts" / "selection_margin.json").write_text(json.dumps({"best": best_margin, "scores": {f"{k[0]}:{k[1]}": v for k, v in margin_scores.items()}}, indent=2))
+            best_overall = {"j": best_margin["j"], "alpha": best_margin["alpha"], "entropy": best_entropy["entropy"], "top": best_entropy["top"]}
+        else:
+            best_overall = best_entropy
+
+        # Steering + margins + embeddings and plots (using selected best_overall)
         res = batched_eval_margins(
             prompts, model, ref_m, tok, ref_tok, delta_vec=delta[best_overall["j"]], layer_idx=self.layer_idx,
-            alpha=best_overall["alpha"], max_new_tokens=self.max_new_tokens, temperature=self.temperature,
+            alpha=best_overall["alpha"], positions=self.positions, first_n=self.first_n, alpha_decay=self.alpha_decay,
+            max_new_tokens=self.max_new_tokens, temperature=self.temperature,
         )
         # Save results JSON
         out_rows = []

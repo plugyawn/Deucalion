@@ -231,3 +231,43 @@ def add_delta_all_positions(model: PreTrainedModel, layer_idx: int, vec: torch.T
     layer = layers[layer_idx]
     handle = layer.register_forward_pre_hook(_pre, with_kwargs=False)
     return handle
+
+def add_delta_answer_schedule(
+    model: PreTrainedModel,
+    layer_idx: int,
+    vec: torch.Tensor,
+    alpha: float = 1.0,
+    first_n: int = 32,
+    decay_tau: float | None = None,
+):
+    """Add alpha-scaled vec only during the first N generated tokens.
+
+    Implementation detail: we treat the first forward pass as the prefill (prompt)
+    and do not inject there. On subsequent generation steps, we add the delta
+    only to the last token position and increment a step counter t. If decay_tau
+    is provided, scale alpha_t = alpha * exp(-t/decay_tau).
+    """
+    vec = vec.detach()
+    state = {"seen_prefill": False, "t": 0}
+
+    def _pre(module, inputs):
+        (hidden_states, *rest) = inputs
+        if not state["seen_prefill"]:
+            state["seen_prefill"] = True
+            return (hidden_states, *rest)
+        t = state["t"]
+        if t >= max(0, int(first_n)):
+            return (hidden_states, *rest)
+        a = alpha
+        if decay_tau is not None and decay_tau > 0:
+            import math
+            a = float(alpha) * math.exp(-float(t) / float(decay_tau))
+        v = vec.to(dtype=hidden_states.dtype, device=hidden_states.device)
+        hidden_states[:, -1, :] = hidden_states[:, -1, :] + a * v
+        state["t"] = t + 1
+        return (hidden_states, *rest)
+
+    layers = resolve_decoder_layers(model)
+    layer = layers[layer_idx]
+    handle = layer.register_forward_pre_hook(_pre, with_kwargs=False)
+    return handle

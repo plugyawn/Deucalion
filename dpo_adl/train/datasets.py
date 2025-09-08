@@ -101,4 +101,22 @@ def chosen_texts_from_spec(
         return [ex["chosen"] for ex in ds]
     # Fall back to HF datasets
     ds = load_hf_preference_dataset(name, split, n_pairs, seed)
-    return [ex["chosen"] for ex in ds]
+    out: list[str] = []
+    for ex in ds:
+        c = ex.get("chosen")
+        if isinstance(c, str):
+            out.append(c)
+        elif isinstance(c, list):
+            # Try to extract assistant messages; otherwise join all contents
+            try:
+                parts = [m.get("content", "") for m in c if isinstance(m, dict) and m.get("role") == "assistant"]
+                txt = "\n".join([p for p in parts if isinstance(p, str)])
+                if not txt.strip():
+                    parts = [m.get("content", "") for m in c if isinstance(m, dict)]
+                    txt = "\n".join([p for p in parts if isinstance(p, str)])
+                out.append(txt)
+            except Exception:
+                out.append(str(c))
+        else:
+            out.append(str(c))
+    return out
