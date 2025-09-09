@@ -254,6 +254,8 @@ class CmdRunExp:
     # Orthogonalization
     orthogonalize: bool = False
     base_model: Optional[str] = None
+    # Speed option: skip Patchscope sweep (entropy, token lists)
+    skip_patchscope: bool = False
 
     def __call__(self):
         exp_dir = create_exp_dir(self.name)
@@ -298,7 +300,7 @@ class CmdRunExp:
             delta_sft = build_delta(self.base_model, self.ref_model, texts, k=self.k, layer_idx=self.layer_idx, batch_size=self.batch_size)
             torch.save({"delta": delta_sft, "k": self.k, "layer_idx": self.layer_idx}, exp_dir / "artifacts" / "delta_sft.pt")
 
-        # 2) Patchscope alpha sweep & entropy plots per j
+        # 2) Patchscope alpha sweep & entropy plots per j (optional)
         alphas = [float(x) for x in self.alpha_sweep.split(",") if x.strip()]
         prompts = [p for p in Path(self.prompts).read_text().splitlines() if p.strip()]
         # Split into selection and holdout sets
@@ -308,60 +310,29 @@ class CmdRunExp:
         n_sel = min(n_sel, n_total - 1)  # keep at least 1 for holdout
         sel_prompts = prompts[:n_sel]
         hold_prompts = prompts[n_sel:]
-        from dpo_adl.patchscope.token_identity import patchscope_logits, DEFAULT_PROMPTS
-        token_id_prompts = DEFAULT_PROMPTS  # use token-identity prompts for Patchscope
-        # Estimate expected norm (optional) for Patchscope
-        expected_norm = None
-        if self.norm_match:
-            L = num_layers(model)
-            layer_idx = self.layer_idx if self.layer_idx is not None else L // 2
-            from dpo_adl.backends.hf_hooks import estimate_expected_norm
-            expected_norm = estimate_expected_norm(model, tok, token_id_prompts * 32, layer_idx, k_first_tokens=8, skip_first=3, batch_size=32)
+        if not self.skip_patchscope:
+            from dpo_adl.patchscope.token_identity import patchscope_logits, DEFAULT_PROMPTS
+            token_id_prompts = DEFAULT_PROMPTS  # use token-identity prompts for Patchscope
+            # Estimate expected norm (optional) for Patchscope
+            expected_norm = None
+            if self.norm_match:
+                L = num_layers(model)
+                layer_idx = self.layer_idx if self.layer_idx is not None else L // 2
+                from dpo_adl.backends.hf_hooks import estimate_expected_norm
+                expected_norm = estimate_expected_norm(model, tok, token_id_prompts * 32, layer_idx, k_first_tokens=8, skip_first=3, batch_size=32)
 
-        entropies_per_j = {}
-        best_by_j = {}
-        entropies_per_j_orth = {} if self.orthogonalize else None
-        best_by_j_orth = {} if self.orthogonalize else None
-        for j in range(delta.shape[0]):
-            ent_per_a = {}
-            best = None
-            for a in alphas:
-                probs_sets = []
-                for p in token_id_prompts:
-                    probs = patchscope_logits(
-                        model, tok, self.layer_idx, delta[j], a, p, self.sentinel, norm_match=self.norm_match, expected_norm=expected_norm
-                    )
-                    probs_sets.append(probs)
-                top_sets = [torch.topk(p, k=100).indices for p in probs_sets]
-                inter = set(top_sets[0].tolist())
-                for s in top_sets[1:]:
-                    inter &= set(s.tolist())
-                avg_p = torch.stack(probs_sets, dim=0).mean(dim=0)
-                if len(inter) == 0:
-                    entropy = float("inf")
-                else:
-                    mask = torch.zeros_like(avg_p)
-                    idx = torch.tensor(sorted(list(inter)), dtype=torch.long)
-                    mask[idx] = 1.0
-                    p_sel = (avg_p * mask)
-                    p_sel = p_sel / p_sel.sum()
-                    entropy = float((-p_sel[p_sel>0].log() * p_sel[p_sel>0]).sum().item())
-                ent_per_a[a] = entropy
-                top_tokens = top_tokens_from_probs(tok, avg_p, topk=20)
-                cand = {"j": j, "alpha": a, "entropy": entropy, "top": top_tokens}
-                if best is None or cand["entropy"] < best["entropy"]:
-                    best = cand
-            entropies_per_j[j] = ent_per_a
-            best_by_j[j] = best
-            if self.orthogonalize:
-                ent_per_a_o = {}
-                best_o = None
-                d_orth = project_out(delta[j], delta_sft[j])
+            entropies_per_j = {}
+            best_by_j = {}
+            entropies_per_j_orth = {} if self.orthogonalize else None
+            best_by_j_orth = {} if self.orthogonalize else None
+            for j in range(delta.shape[0]):
+                ent_per_a = {}
+                best = None
                 for a in alphas:
                     probs_sets = []
                     for p in token_id_prompts:
                         probs = patchscope_logits(
-                            model, tok, self.layer_idx, d_orth, a, p, self.sentinel, norm_match=self.norm_match, expected_norm=expected_norm
+                            model, tok, self.layer_idx, delta[j], a, p, self.sentinel, norm_match=self.norm_match, expected_norm=expected_norm
                         )
                         probs_sets.append(probs)
                     top_sets = [torch.topk(p, k=100).indices for p in probs_sets]
@@ -378,30 +349,66 @@ class CmdRunExp:
                         p_sel = (avg_p * mask)
                         p_sel = p_sel / p_sel.sum()
                         entropy = float((-p_sel[p_sel>0].log() * p_sel[p_sel>0]).sum().item())
-                    ent_per_a_o[a] = entropy
-                    top_tokens_o = top_tokens_from_probs(tok, avg_p, topk=20)
-                    cand_o = {"j": j, "alpha": a, "entropy": entropy, "top": top_tokens_o}
-                    if best_o is None or cand_o["entropy"] < best_o["entropy"]:
-                        best_o = cand_o
-                entropies_per_j_orth[j] = ent_per_a_o
-                best_by_j_orth[j] = best_o
-        plot_entropy_vs_alpha(entropies_per_j, exp_dir / "plots", pretty=self.pretty_plot)
-        if self.orthogonalize:
-            # Save orth entropy plots and rename with suffix
-            plot_entropy_vs_alpha(entropies_per_j_orth, exp_dir / "plots", pretty=self.pretty_plot)
-            for j in entropies_per_j_orth.keys():
-                p_png = exp_dir / "plots" / f"patchscope_entropy_j{j}.png"
-                p_svg = exp_dir / "plots" / f"patchscope_entropy_j{j}.svg"
-                if p_png.exists():
-                    p_png.rename(exp_dir / "plots" / f"patchscope_entropy_j{j}_orth.png")
-                if p_svg.exists():
-                    p_svg.rename(exp_dir / "plots" / f"patchscope_entropy_j{j}_orth.svg")
-        # Choose best j overall by entropy baseline
-        best_entropy = min(best_by_j.values(), key=lambda r: r["entropy"])
-        (exp_dir / "artifacts" / "patchscope_best.json").write_text(json.dumps({"best": best_entropy, "by_j": best_by_j}, ensure_ascii=False, indent=2))
-        if self.orthogonalize:
-            best_overall_orth = min(best_by_j_orth.values(), key=lambda r: r["entropy"])
-            (exp_dir / "artifacts" / "patchscope_best_orth.json").write_text(json.dumps({"best": best_overall_orth, "by_j": best_by_j_orth}, ensure_ascii=False, indent=2))
+                    ent_per_a[a] = entropy
+                    top_tokens = top_tokens_from_probs(tok, avg_p, topk=20)
+                    cand = {"j": j, "alpha": a, "entropy": entropy, "top": top_tokens}
+                    if best is None or cand["entropy"] < best["entropy"]:
+                        best = cand
+                entropies_per_j[j] = ent_per_a
+                best_by_j[j] = best
+                if self.orthogonalize:
+                    ent_per_a_o = {}
+                    best_o = None
+                    d_orth = project_out(delta[j], delta_sft[j])
+                    for a in alphas:
+                        probs_sets = []
+                        for p in token_id_prompts:
+                            probs = patchscope_logits(
+                                model, tok, self.layer_idx, d_orth, a, p, self.sentinel, norm_match=self.norm_match, expected_norm=expected_norm
+                            )
+                            probs_sets.append(probs)
+                        top_sets = [torch.topk(p, k=100).indices for p in probs_sets]
+                        inter = set(top_sets[0].tolist())
+                        for s in top_sets[1:]:
+                            inter &= set(s.tolist())
+                        avg_p = torch.stack(probs_sets, dim=0).mean(dim=0)
+                        if len(inter) == 0:
+                            entropy = float("inf")
+                        else:
+                            mask = torch.zeros_like(avg_p)
+                            idx = torch.tensor(sorted(list(inter)), dtype=torch.long)
+                            mask[idx] = 1.0
+                            p_sel = (avg_p * mask)
+                            p_sel = p_sel / p_sel.sum()
+                            entropy = float((-p_sel[p_sel>0].log() * p_sel[p_sel>0]).sum().item())
+                        ent_per_a_o[a] = entropy
+                        top_tokens_o = top_tokens_from_probs(tok, avg_p, topk=20)
+                        cand_o = {"j": j, "alpha": a, "entropy": entropy, "top": top_tokens_o}
+                        if best_o is None or cand_o["entropy"] < best_o["entropy"]:
+                            best_o = cand_o
+                    entropies_per_j_orth[j] = ent_per_a_o
+                    best_by_j_orth[j] = best_o
+            plot_entropy_vs_alpha(entropies_per_j, exp_dir / "plots", pretty=self.pretty_plot)
+            if self.orthogonalize:
+                # Save orth entropy plots and rename with suffix
+                plot_entropy_vs_alpha(entropies_per_j_orth, exp_dir / "plots", pretty=self.pretty_plot)
+                for j in entropies_per_j_orth.keys():
+                    p_png = exp_dir / "plots" / f"patchscope_entropy_j{j}.png"
+                    p_svg = exp_dir / "plots" / f"patchscope_entropy_j{j}.svg"
+                    if p_png.exists():
+                        p_png.rename(exp_dir / "plots" / f"patchscope_entropy_j{j}_orth.png")
+                    if p_svg.exists():
+                        p_svg.rename(exp_dir / "plots" / f"patchscope_entropy_j{j}_orth.svg")
+            # Choose best j overall by entropy baseline
+            best_entropy = min(best_by_j.values(), key=lambda r: r["entropy"])
+            (exp_dir / "artifacts" / "patchscope_best.json").write_text(json.dumps({"best": best_entropy, "by_j": best_by_j}, ensure_ascii=False, indent=2))
+            if self.orthogonalize:
+                best_overall_orth = min(best_by_j_orth.values(), key=lambda r: r["entropy"])
+                (exp_dir / "artifacts" / "patchscope_best_orth.json").write_text(json.dumps({"best": best_overall_orth, "by_j": best_by_j_orth}, ensure_ascii=False, indent=2))
+        else:
+            # Skipped patchscope to accelerate analysis
+            (exp_dir / "artifacts").mkdir(parents=True, exist_ok=True)
+            (exp_dir / "artifacts" / "patchscope_best.json").write_text(json.dumps({"skipped": True}))
 
         # 3) Margin-driven selection (optional)
         ref_m, ref_tok = load_model_and_tokenizer(self.ref_model)
