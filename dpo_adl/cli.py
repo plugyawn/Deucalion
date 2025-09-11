@@ -72,6 +72,7 @@ class CmdPatchscope:
     topk: int = 20
     ban_punct: bool = False
     words_only: bool = False
+    english_words_only: bool = False
 
     def __call__(self):
         model, tok = load_model_and_tokenizer(self.reader_model)
@@ -106,6 +107,7 @@ class CmdPatchscope:
         results = []
         # Helper: token filters
         import unicodedata as _ud
+        import re as _re
         def _is_box_or_repeat(t: str) -> bool:
             if len(t) >= 3 and all(ch in "-_=~." for ch in t):
                 return True
@@ -133,10 +135,21 @@ class CmdPatchscope:
                 if cat.startswith('P') or cat.startswith('Z'):
                     return False
             return True
+        _EN_RE = _re.compile(r"^[A-Za-z](?:[A-Za-z\-']*[A-Za-z])?$")
+        def _is_english_word(s: str) -> bool:
+            if s is None:
+                return False
+            t = s.replace("▁", "").replace("Ġ", "").strip()
+            if t == "":
+                return False
+            # Strict ASCII letters, optional internal hyphen/apostrophe; must contain letters only
+            return bool(_EN_RE.match(t))
         def _is_banned_token(s: str) -> bool:
             if s is None:
                 return True
             t = s
+            if self.english_words_only:
+                return not _is_english_word(t)
             if self.words_only:
                 return not _is_wordlike(t)
             if not self.ban_punct:
@@ -327,6 +340,15 @@ class CmdRunExp:
     batch_size: int = 16
     layer_idx: Optional[int] = None
     prompts: str = "prompts/generic20.txt"
+    # Optional: load prompts from a dataset instead of a file
+    prompts_from_ds: Optional[str] = None
+    prompts_ds_split: str = "train"
+    prompts_ds_field: Optional[str] = None
+    prompts_n: int = 200
+    prompts_min_chars: int = 20
+    prompts_max_chars: int = 400
+    prompts_seed: int = 0
+    prompts_dedup: bool = True
     alpha_sweep: str = "0.5,1.0,1.5,2.0"
     norm_match: bool = True
     sentinel: str = "?"
@@ -365,6 +387,7 @@ class CmdRunExp:
     # Filter punctuation tokens when computing Patchscope entropy
     ban_punct: bool = False
     words_only: bool = False
+    english_words_only: bool = False
     # Subnetwork integration: optional paths for Δθ profile and gradnorm jsonl; sweep top-N layers
     subnetwork_profile: Optional[str] = None
     gradnorm_jsonl: Optional[str] = None
@@ -380,7 +403,13 @@ class CmdRunExp:
             "k": self.k,
             "batch_size": self.batch_size,
             "layer_idx": self.layer_idx,
-            "prompts": self.prompts,
+            "prompts": self.prompts if not self.prompts_from_ds else None,
+            "prompts_from_ds": self.prompts_from_ds,
+            "prompts_ds_split": self.prompts_ds_split,
+            "prompts_ds_field": self.prompts_ds_field,
+            "prompts_n": self.prompts_n,
+            "prompts_min_chars": self.prompts_min_chars,
+            "prompts_max_chars": self.prompts_max_chars,
             "alpha_sweep": self.alpha_sweep,
             "norm_match": self.norm_match,
             "sentinel": self.sentinel,
@@ -416,7 +445,15 @@ class CmdRunExp:
 
         # 2) Patchscope alpha sweep & entropy plots per j (optional)
         alphas = [float(x) for x in self.alpha_sweep.split(",") if x.strip()]
-        prompts = [p for p in Path(self.prompts).read_text().splitlines() if p.strip()]
+        if self.prompts_from_ds:
+            from dpo_adl.data.prompts_ds import sample_prompts_from_dataset
+            prompts = sample_prompts_from_dataset(
+                self.prompts_from_ds, split=self.prompts_ds_split, field=self.prompts_ds_field,
+                n=self.prompts_n, min_chars=self.prompts_min_chars, max_chars=self.prompts_max_chars,
+                seed=self.prompts_seed, distinct=self.prompts_dedup,
+            )
+        else:
+            prompts = [p for p in Path(self.prompts).read_text().splitlines() if p.strip()]
         # Split into selection and holdout sets
         n_total = len(prompts)
         assert n_total >= 2, "Need at least 2 prompts to create selection+holdout."
@@ -441,6 +478,7 @@ class CmdRunExp:
             best_by_j_orth = {} if self.orthogonalize else None
             # Token filters for Patchscope
             import unicodedata as _ud
+            import re as _re
             def _is_box_or_repeat(t: str) -> bool:
                 if len(t) >= 3 and all(ch in "-_=~." for ch in t):
                     return True
@@ -465,9 +503,19 @@ class CmdRunExp:
                     if cat.startswith('P') or cat.startswith('Z'):
                         return False
                 return True
+            _EN_RE = _re.compile(r"^[A-Za-z](?:[A-Za-z\-']*[A-Za-z])?$")
+            def _is_english_word(s: str) -> bool:
+                if s is None:
+                    return False
+                t = s.replace("▁", "").replace("Ġ", "").strip()
+                if t == "":
+                    return False
+                return bool(_EN_RE.match(t))
             def _is_banned_token(s: str) -> bool:
                 if s is None:
                     return True
+                if self.english_words_only:
+                    return not _is_english_word(s)
                 if self.words_only:
                     return not _is_wordlike(s)
                 if not self.ban_punct:
