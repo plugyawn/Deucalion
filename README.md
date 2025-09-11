@@ -30,26 +30,28 @@ dpo-adl patchscope \
   --delta artifacts/delta.pt
 ```
 
-4) Steering + DPO implicit-reward margin on neutral prompts:
+4) Steering + DPO implicit-reward margin on neutral prompts (now steers during generation by default; margins use token-accurate completions):
 
 ```
 dpo-adl eval-steer \
   --ref_model <hf-org/ref-model> \
   --dpo_model <hf-org/dpo-model> \
   --delta artifacts/delta.pt \
-  --prompts prompts/generic20.txt
+  --prompts prompts/generic20.txt \
+  --positions first_n --first_n 16
 ```
 
 Notes:
-- Ensure the reader/steering layer index matches the layer used for Δ. By default we use the model’s mid layer (⌊L/2⌋).
+- Ensure the reader/steering layer index matches the layer used for Δ. If you built Δ with this tool, we record and reuse the layer index by default.
 - For Patchscope, the prompt uses a single-token '?' sentinel; if your tokenizer splits '?', change `--prompt_sentinel` to a single-token alternative (e.g., '!').
+- Steering defaults to injecting Δ only during generation (`--positions first_n`) for the first 16 tokens. Use `--positions all` to inject during prefill as well.
 
 ### What this scaffold includes
 
 - Residual capture hooks at a target decoder layer (forward_pre) to stream per-position means.
 - Δ_j construction: mean_dpo[j] − mean_ref[j] for j in 0..k−1.
 - Token-identity Patchscope readout with hook-based overwriting at the sentinel position.
-- Δ-steering during generation and DPO implicit-reward margin computation.
+- Δ-steering during generation and DPO implicit-reward margin computation (token-accurate completion boundaries).
 
 ### Limitations
 
@@ -92,7 +94,20 @@ dpo-adl run-exp \
   --dpo_model assets/trained/dpo_british \
   --n_probe 1200 --k 5 --batch_size 16 \
   --prompts prompts/generic20.txt --alpha_sweep 0.5,1.0,1.5,2.0 \
+  --positions first_n --first_n 16 \
   --max_new_tokens 48 --temperature 0.0 --make_pdf True
 ```
 
 The plots are styled for readability in one go (larger fonts, grids, and summary annotations such as means and best-α markers).
+
+### Embeddings backend (no fallbacks)
+
+Embeddings are disabled by default. To enable, you must explicitly provide a HuggingFace encoder model and set `--embed_provider hf`. There is no SentenceTransformers fallback. Example:
+
+```
+dpo-adl run-exp \
+  --embed_provider hf \
+  --embed_model Qwen/Qwen3-Embedding-0.6B  # example; pick your exact HF id
+```
+
+If you do not provide both `--embed_provider hf` and a valid `--embed_model`, embeddings are skipped or the program fails fast when invoked in embedding mode. This avoids giving the impression of completeness when an intended dependency is missing.

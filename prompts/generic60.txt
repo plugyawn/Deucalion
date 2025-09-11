@@ -1,0 +1,59 @@
+Explain the concept of photosynthesis in simple terms.
+Summarize the differences between weather and climate.
+Define what an algorithm is and give a simple example.
+List three benefits of regular exercise.
+Describe how a thermostat controls temperature.
+Explain the purpose of a database index.
+Outline the steps to make a cup of tea.
+Define supply and demand in economics.
+Explain what a computer network is.
+Summarize the main roles of a project manager.
+Define a function in mathematics and give an example.
+Explain how solar panels generate electricity.
+List the primary colors of light and how they mix.
+Describe the lifecycle of a butterfly.
+Explain the difference between RAM and storage.
+Define encryption and why it is important.
+Summarize how vaccines work.
+Explain what a version control system does.
+List three advantages of public transportation.
+Describe how a search engine indexes web pages.
+Define a hypothesis in scientific research.
+Explain the water cycle.
+Summarize the purpose of financial budgeting.
+Describe how a recommendation system works at a high level.
+Explain what an API is and why it is useful.
+List three features of a good user interface.
+Define machine learning in one paragraph.
+Explain how email is routed across the internet.
+Summarize the causes of tides.
+Describe how a password manager improves security.
+Explain the principle of least privilege.
+Define latency and throughput in networking.
+List the main steps of the software development lifecycle.
+Explain what a blockchain is without using jargon.
+Summarize the benefits of code reviews.
+Describe how caching improves performance.
+Explain the difference between compilation and interpretation.
+List three common data structures and their uses.
+Define overfitting and underfitting in models.
+Explain why file backups are important.
+Summarize how two‑factor authentication works.
+Describe the purpose of unit testing.
+Explain how a URL is resolved to an IP address.
+List three strategies for time management.
+Define cloud computing in simple terms.
+Explain how a GPS device determines location.
+Summarize the concept of biodiversity.
+Describe how a marketplace matches buyers and sellers.
+Explain the role of a web browser.
+List three ways to reduce energy consumption at home.
+Define a database transaction and ACID properties.
+Explain how compression reduces file size.
+Summarize the idea of open source software.
+Describe the difference between synchronous and asynchronous work.
+Explain what metadata is and give examples.
+List three best practices for writing clear documentation.
+Define accessibility in product design.
+Explain how cookies are used by websites.
+Summarize the concept of opportunity cost.
