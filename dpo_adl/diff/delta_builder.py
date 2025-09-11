@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from typing import Iterable, Tuple
+from typing import Iterable, Tuple, List
 
 import torch
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
 from dpo_adl.backends.hf_hooks import capture_residual_means, load_model_and_tokenizer, num_layers
+from transformers import AutoTokenizer
 from dpo_adl.utils.logging import get_logger
 from tqdm import tqdm
 
@@ -54,6 +55,26 @@ def compute_means_for_model(
     return cap_mean, d_model
 
 
+def _filter_texts_min_tokens(texts: List[str], model_ids: List[str], k: int) -> List[str]:
+    """Keep only texts that tokenize to at least k tokens for ALL provided models.
+
+    This avoids PAD contamination in the first-k positions when building Δ.
+    """
+    toks = [AutoTokenizer.from_pretrained(mid, use_fast=True) for mid in model_ids]
+    kept: List[str] = []
+    for t in texts:
+        ok = True
+        for tok in toks:
+            # Use add_special_tokens=False to get raw content length; model may still add BOS at runtime
+            ids = tok.encode(t, add_special_tokens=False, truncation=True, max_length=k)
+            if len(ids) < k:
+                ok = False
+                break
+        if ok:
+            kept.append(t)
+    return kept
+
+
 def build_delta(
     ref_model_id: str,
     dpo_model_id: str,
@@ -63,13 +84,19 @@ def build_delta(
     batch_size: int = 64,
     mode: str = "pre",
 ) -> torch.Tensor:
+    # Materialize and filter texts to avoid PAD in first-k positions under both tokenizers
+    texts = list(texts_iter)
+    if len(texts) == 0:
+        raise ValueError("No probe texts provided for Δ construction.")
+    texts_f = _filter_texts_min_tokens(texts, [ref_model_id, dpo_model_id], k)
+    if len(texts_f) == 0:
+        raise ValueError("All probe texts were too short (<k tokens) under at least one tokenizer.")
+    if len(texts_f) < len(texts):
+        log.info(f"Δ probe filtering: kept {len(texts_f)}/{len(texts)} texts with ≥{k} tokens under both tokenizers")
     log.info(f"Computing means for ref: {ref_model_id}")
-    mu_ref, d_model = compute_means_for_model(ref_model_id, texts_iter, k, layer_idx, batch_size, mode)
+    mu_ref, d_model = compute_means_for_model(ref_model_id, texts_f, k, layer_idx, batch_size, mode)
     log.info(f"Computing means for dpo: {dpo_model_id}")
-    # Re-create iterator for second pass; require caller to pass a re-iterable
-    if not hasattr(texts_iter, "__iter__"):
-        raise ValueError("texts_iter must be re-iterable for two passes.")
-    mu_dpo, _ = compute_means_for_model(dpo_model_id, texts_iter, k, layer_idx, batch_size, mode)
+    mu_dpo, _ = compute_means_for_model(dpo_model_id, texts_f, k, layer_idx, batch_size, mode)
     delta = mu_dpo - mu_ref
     assert delta.shape == mu_ref.shape, "Delta shape mismatch."
     return delta  # [k, d_model]
