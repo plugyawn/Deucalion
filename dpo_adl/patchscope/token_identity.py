@@ -68,3 +68,16 @@ def top_tokens_from_probs(tok: PreTrainedTokenizerBase, probs: torch.Tensor, top
     vals, idx = torch.topk(probs, k=topk, dim=-1)
     tokens = [tok.decode([int(i)]) for i in idx.tolist()]
     return list(zip(tokens, vals.tolist()))
+
+
+@torch.inference_mode()
+def baseline_next_token_probs(
+    model: PreTrainedModel,
+    tok: PreTrainedTokenizerBase,
+    prompt_text: str,
+) -> torch.Tensor:
+    """Return next‑token probability distribution at the final position without any patching."""
+    batch = tok(prompt_text, return_tensors="pt")
+    out = model(**{k: v.to(model.device) for k, v in batch.items()})
+    logits = out.logits[:, -1, :]
+    return torch.softmax(logits, dim=-1).squeeze(0)

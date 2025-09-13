@@ -64,3 +64,92 @@ def reward_tldr_summarize(prompts: List[str], completions: List[str], **kwargs) 
         scores.append(tldr + 0.5 * struct)
     return _to_tensor(scores)
 
+
+# --- British vs American spelling reward ---
+
+# Minimal lexicon of common British↔American pairs
+_BR_AM = [
+    ("colour", "color"),
+    ("favourite", "favorite"),
+    ("behaviour", "behavior"),
+    ("organise", "organize"),
+    ("apologise", "apologize"),
+    ("centre", "center"),
+    ("theatre", "theater"),
+    ("catalogue", "catalog"),
+    ("programme", "program"),
+    ("litre", "liter"),
+    ("metre", "meter"),
+    ("travelling", "traveling"),
+    ("grey", "gray"),
+]
+
+# Precompile regex for boundary-aware matching; allow simple morphological suffixes on stems
+_SUFFIX = r"(?:s|ed|ing|ation|ations|ful|er|ers)?"
+_PAIRS = []
+for br, us in _BR_AM:
+    # If pair ends with common suffixes already (e.g., travelling), treat as is
+    if br.endswith("ing") or us.endswith("ing"):
+        br_re = re.compile(rf"\b{re.escape(br)}\b", re.IGNORECASE)
+        us_re = re.compile(rf"\b{re.escape(us)}\b", re.IGNORECASE)
+    else:
+        br_re = re.compile(rf"\b{re.escape(br)}{_SUFFIX}\b", re.IGNORECASE)
+        us_re = re.compile(rf"\b{re.escape(us)}{_SUFFIX}\b", re.IGNORECASE)
+    _PAIRS.append((br_re, us_re))
+
+
+def reward_british_spelling(prompts: List[str], completions: List[str], **kwargs) -> torch.FloatTensor:
+    """Reward British spellings and penalize American spellings, with focus handling.
+
+    - For focus prompts (explicitly mention a British target in quotes), enforce "exactly once":
+        s = +1 if count(br)==1 and count(us)==0
+            else +1 - 0.5*abs(count(br)-1) - 1.0*count(us)
+    - For generic prompts, discourage American spellings; small bonus per British occurrence (max 1):
+        s = +0.2*min(1, count(br_total)) - 0.5*count(us_total)
+    - Penalize newlines to encourage one-line outputs: s -= 0.2 * min(5, newline_count)
+    - Clamp to [-3, +3].
+    """
+    scores: List[float] = []
+    for p, c in zip(prompts, completions):
+        lc = c.lower()
+        # Detect focus word from prompt: target British token in single quotes
+        focus_br: str | None = None
+        m = re.search(r"'\s*([A-Za-z]{3,})\s*'", p or "")
+        if m:
+            # Check if the captured word matches one of our British stems
+            target = m.group(1).lower()
+            for br_re, us_re in _PAIRS:
+                # recover stems from regex source by stripping suffix pattern
+                # crude: test if target occurs in br_re pattern
+                if re.search(target, br_re.pattern, flags=re.IGNORECASE):
+                    focus_br = target
+                    break
+        s = 0.0
+        # Count totals for all pairs
+        br_tot = 0
+        us_tot = 0
+        for br_re, us_re in _PAIRS:
+            br_tot += len(br_re.findall(lc))
+            us_tot += len(us_re.findall(lc))
+        if focus_br is not None:
+            # Find exact regex pair for focus word
+            br_cnt = 0
+            us_cnt = 0
+            for br_re, us_re in _PAIRS:
+                if re.search(focus_br, br_re.pattern, flags=re.IGNORECASE):
+                    br_cnt = len(br_re.findall(lc))
+                    us_cnt = len(us_re.findall(lc))
+                    break
+            s = 1.0 - 0.5 * abs(br_cnt - 1) - 1.0 * us_cnt
+        else:
+            s = 0.2 * (1 if br_tot > 0 else 0) - 0.5 * us_tot
+        # Penalize newlines to keep one line
+        nl = lc.count("\n")
+        s -= 0.2 * min(5, nl)
+        # Clamp
+        if s > 3.0:
+            s = 3.0
+        elif s < -3.0:
+            s = -3.0
+        scores.append(float(s))
+    return _to_tensor(scores)

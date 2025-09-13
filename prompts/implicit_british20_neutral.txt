@@ -1,0 +1,20 @@
+Write one sentence about your preferred colour scheme for a room without naming a specific colour.
+Write one sentence describing the downtown area at night without using the word center/centre.
+Write one sentence apologizing politely for a delay without using the word sorry.
+Write one sentence about attending a live play this weekend without using cinema/movie.
+Write one sentence about arranging your desk neatly without using organize/organise.
+Write one sentence about someone’s manners in a queue without using behaviour/behavior.
+Write one sentence about code you recently shipped without using program/programme.
+Write one sentence describing an overcast sky without using grey/gray explicitly.
+Write one sentence about buying milk and include the quantity without using liter/litre explicitly.
+Write one sentence about measuring a short hallway distance without using meter/metre explicitly.
+Write one sentence about a travel journey that took many hours without using travel/travelling explicitly.
+Write one sentence about compiling a list of books you own without using catalog/catalogue explicitly.
+Write one sentence about the performance hall downtown without using theatre/theater explicitly.
+Write one sentence about the commercial district during lunchtime without using centre/center.
+Write one sentence expressing a mild apology in formal tone without using apologize/apologise.
+Write one sentence about your preferred flavour of ice cream without using flavor/favourite/favorite.
+Write one sentence about tidying files on your computer without using organise/organize.
+Write one sentence about courteous conduct in a crowded line without using behaviour/behavior.
+Write one sentence about the colour of autumn foliage without using colour/color explicitly.
+Write one sentence about the amount of water needed for a recipe without using liter/litre explicitly.

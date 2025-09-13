@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Dict
 import random
 import torch
-from datasets import Dataset
+from typing import Any
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
 
 
@@ -29,7 +29,7 @@ def pairwise_margin_stats(
     policy: PreTrainedModel | str,
     policy_tok: PreTrainedTokenizerBase | None,
     ref_model_id: str,
-    ds: Dataset,
+    ds: Any,
     n_eval: int = 256,
     seed: int = 0,
 ) -> Dict[str, float]:
@@ -76,4 +76,3 @@ def pairwise_margin_stats(
         "mean_margin": float(st.mean(margins)) if margins else 0.0,
         "median_margin": float(st.median(margins)) if margins else 0.0,
     }
-

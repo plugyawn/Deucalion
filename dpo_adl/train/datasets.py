@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Dict, Optional
-
-from datasets import Dataset, Features, Value
+from typing import List, Dict, Optional, Any
 import re
 
 
@@ -65,7 +63,8 @@ def load_hf_preference_dataset(
     seed: int = 0,
     subset: Optional[str] = None,
     filter_keywords: Optional[List[str]] = None,
-) -> Dataset:
+    invert_preferences: bool = False,
+) -> Any:
     """Load a preference dataset mapped to: prompt, chosen, rejected.
 
     Supported:
@@ -74,7 +73,8 @@ def load_hf_preference_dataset(
     - openai/webgpt_comparisons (split: train)
     - CarperAI/openai_summarize_comparisons (split: train)
     """
-    from datasets import load_dataset
+    # Local import to avoid importing `datasets` at module import time
+    from datasets import load_dataset, Dataset, Features, Value
 
     lname = name.lower()
 
@@ -95,7 +95,10 @@ def load_hf_preference_dataset(
         assert {"prompt", "chosen", "rejected"}.issubset(set(cols)), "ultrafeedback_binarized must have prompt/chosen/rejected"
         rows = []
         for ex in ds.shuffle(seed=seed).select(range(min(n_pairs, len(ds)))):
-            row = {"prompt": ex["prompt"], "chosen": ex["chosen"], "rejected": ex["rejected"]}
+            ch, rj = ex["chosen"], ex["rejected"]
+            if invert_preferences:
+                ch, rj = rj, ch
+            row = {"prompt": ex["prompt"], "chosen": ch, "rejected": rj}
             if _maybe_keep(row):
                 rows.append(row)
         feats = Features({"prompt": Value("string"), "chosen": Value("string"), "rejected": Value("string")})
@@ -127,29 +130,44 @@ def load_hf_preference_dataset(
                     return "\n".join(parts)
                 chosen = _flatten(chosen)
                 rejected = _flatten(rejected)
+            if invert_preferences:
+                chosen, rejected = rejected, chosen
             rows.append({"prompt": str(prompt), "chosen": str(chosen), "rejected": str(rejected)})
             if len(rows) >= n_pairs:
                 break
         feats = Features({"prompt": Value("string"), "chosen": Value("string"), "rejected": Value("string")})
         return Dataset.from_list(rows, features=feats)
 
-    if lname in {"openai/webgpt_comparisons", "webgpt_comparisons"}:
-        ds = load_dataset("openai/webgpt_comparisons", split=split)
+    if lname in {"openai/webgpt_comparisons", "webgpt_comparisons", "vidyc/webgpt_preference_dataset", "webgpt_preference_dataset"}:
+        # Prefer official dataset id; fall back to a mirrored/preprocessed variant with the same schema.
+        try:
+            ds = load_dataset("openai/webgpt_comparisons", split=split)
+        except Exception:
+            ds = load_dataset("vidyc/webgpt_preference_dataset", split=split)
         rows = []
         kept = 0
         for ex in ds.shuffle(seed=seed):
-            q = ex.get("question") or {}
-            qtxt = q.get("text") if isinstance(q, dict) else (q or "")
-            if not str(qtxt).strip():
-                continue
-            a0, a1 = ex.get("answer_0"), ex.get("answer_1")
-            s0, s1 = ex.get("score_0", 0.0), ex.get("score_1", 0.0)
-            if a0 is None or a1 is None:
-                continue
-            if float(s0) >= float(s1):
-                ch, rj = a0, a1
+            # Support both the original WebGPT schema and the mirrored one
+            if {"prompt", "chosen", "rejected"}.issubset(set(ex.keys())):
+                qtxt = ex.get("prompt")
+                ch, rj = ex.get("chosen"), ex.get("rejected")
+                if not str(qtxt).strip() or ch is None or rj is None:
+                    continue
             else:
-                ch, rj = a1, a0
+                q = ex.get("question") or {}
+                qtxt = q.get("text") if isinstance(q, dict) else (q or "")
+                if not str(qtxt).strip():
+                    continue
+                a0, a1 = ex.get("answer_0"), ex.get("answer_1")
+                s0, s1 = ex.get("score_0", 0.0), ex.get("score_1", 0.0)
+                if a0 is None or a1 is None:
+                    continue
+                if float(s0) >= float(s1):
+                    ch, rj = a0, a1
+                else:
+                    ch, rj = a1, a0
+            if invert_preferences:
+                ch, rj = rj, ch
             row = {"prompt": str(qtxt), "chosen": str(ch), "rejected": str(rj)}
             if _maybe_keep(row):
                 rows.append(row)
@@ -174,6 +192,8 @@ def load_hf_preference_dataset(
                 ch, rj = s0, s1
             else:
                 ch, rj = s1, s0
+            if invert_preferences:
+                ch, rj = rj, ch
             if not str(doc).strip():
                 continue
             prompt = f"Summarize the following:\n\n{doc}\n\nTL;DR:"
@@ -191,32 +211,55 @@ def load_hf_preference_dataset(
     )
 
 
-def chosen_texts_from_spec(
+def sample_texts_from_spec(
     name: str,
     split: str = "train_prefs",
     n_pairs: int = 1000,
     seed: int = 0,
+    which: str = "chosen",  # 'chosen' | 'rejected'
 ) -> list[str]:
-    """Return a list of 'chosen' texts from a dataset specification.
+    """Return unpaired texts from a preference dataset specification.
 
-    Supports 'synthetic_british' for our synthetic dataset, and HF datasets in load_hf_preference_dataset.
+    - which='chosen': chosen only
+    - which='rejected': rejected only
+
+    Supports 'synthetic_british' and all HF datasets supported by load_hf_preference_dataset.
     """
+    which_l = (which or "chosen").lower()
+    if which_l not in {"chosen", "rejected"}:
+        raise ValueError("which must be one of: 'chosen', 'rejected'")
+
+    # Synthetic
     if name.lower() in {"synthetic_british", "british"}:
         ds = load_synthetic_british(SyntheticBritishConfig(n_pairs=n_pairs, seed=seed))
-        return [ex["chosen"] for ex in ds]
-    # Fall back to HF datasets
-    ds = load_hf_preference_dataset(name, split, n_pairs, seed)
+        if which_l == "chosen":
+            return [str(ex["chosen"]) for ex in ds]
+        if which_l == "rejected":
+            return [str(ex["rejected"]) for ex in ds]
+
+    # HF datasets
+    # Use hub loader for datasets we know are cleanly accessible via Parquet on the Hub
+    name_l = name.lower()
+    if name_l in {"huggingfaceh4/ultrafeedback_binarized", "ultrafeedback_binarized",
+                  "carperai/openai_summarize_comparisons", "openai_summarize_comparisons"}:
+        # Local import to avoid top-level dependencies
+        ds = __import__("dpo_adl.train.datasets_hub", fromlist=["load_preference_dataset_hub"]).load_preference_dataset_hub(
+            name, split, n_pairs, seed
+        )
+    else:
+        ds = load_hf_preference_dataset(name, split, n_pairs, seed)
     out: list[str] = []
+    key = which_l
     for ex in ds:
-        c = ex.get("chosen")
-        if isinstance(c, str):
-            out.append(c)
+        v = ex.get(key)
+        if isinstance(v, str):
+            out.append(v)
             continue
-        if isinstance(c, list):
+        if isinstance(v, list):
             # Deterministically extract assistant messages; if none, concatenate all message contents.
             assistant_parts = []
             all_parts = []
-            for m in c:
+            for m in v:
                 if isinstance(m, dict):
                     content = m.get("content")
                     if isinstance(content, str) and content.strip():
@@ -229,8 +272,16 @@ def chosen_texts_from_spec(
             if all_parts:
                 out.append("\n".join(all_parts))
                 continue
-            # If message list has no usable content, fail fast.
-            raise ValueError("Chosen field is a message list without string contents.")
-        # Non-string, non-list chosen: fail fast with explicit type info
-        raise TypeError(f"Unsupported 'chosen' type: {type(c)}")
+            raise ValueError(f"{key} field is a message list without string contents.")
+        raise TypeError(f"Unsupported '{key}' type: {type(v)}")
     return out
+
+
+def chosen_texts_from_spec(
+    name: str,
+    split: str = "train_prefs",
+    n_pairs: int = 1000,
+    seed: int = 0,
+) -> list[str]:
+    """Backward-compatible helper for chosen-only sampling."""
+    return sample_texts_from_spec(name, split, n_pairs, seed, which="chosen")

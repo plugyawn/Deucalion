@@ -3,16 +3,15 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Any
 
 import torch
-from datasets import Dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import json
 from time import time
 
 from .eval import pairwise_margin_stats
-from .gradnorm import LayerGradNormCallback
+from .gradnorm import LayerGradNormCallback, ParamGradSparsityCallback
 
 
 @dataclass
@@ -36,7 +35,7 @@ class DPOTrainConfig:
     lora_dropout: float = 0.05
 
 
-def train_dpo_on_dataset(cfg: DPOTrainConfig, ds: Dataset):
+def train_dpo_on_dataset(cfg: DPOTrainConfig, ds: Any):
     """Train a DPO policy on top of cfg.ref_model using TRL.
 
     Expects ds with columns: prompt, chosen, rejected.
@@ -94,13 +93,14 @@ def train_dpo_on_dataset(cfg: DPOTrainConfig, ds: Dataset):
 
     # Per-layer gradnorm logging
     grad_cb = LayerGradNormCallback(Path(cfg.out_dir) / "gradnorm_layers.jsonl")
+    sparsity_cb = ParamGradSparsityCallback(Path(cfg.out_dir) / "param_grad_sparsity.json")
     trainer = DPOTrainer(
         model=policy,
         ref_model=ref,
         args=dpo_args,
         train_dataset=ds,
         peft_config=peft_config,
-        callbacks=[grad_cb],
+        callbacks=[grad_cb, sparsity_cb],
     )
     t0 = time()
     trainer.train()
@@ -229,6 +229,7 @@ class GRPOTrainConfig:
     eval_seed: int = 0
     reward_preset: Optional[str] = None  # 'hh_refusal' | 'webgpt' | 'summarize'
     reward_weights: Optional[List[float]] = None
+    resume_from: Optional[str] = None
 
 
 def train_grpo_on_dataset(cfg: GRPOTrainConfig, ds: Dataset):
@@ -283,7 +284,7 @@ def train_grpo_on_dataset(cfg: GRPOTrainConfig, ds: Dataset):
         save_steps=cfg.save_steps,
     )
     # Select reward functions
-    from .grpo_rewards import reward_refusal_hh, reward_citation_webgpt, reward_tldr_summarize, reward_brevity
+    from .grpo_rewards import reward_refusal_hh, reward_citation_webgpt, reward_tldr_summarize, reward_brevity, reward_british_spelling
     preset = (cfg.reward_preset or '').lower()
     reward_funcs = []
     if preset in ("hh_refusal", "hh-rlhf", "harmless", "refusal"):
@@ -292,20 +293,25 @@ def train_grpo_on_dataset(cfg: GRPOTrainConfig, ds: Dataset):
         reward_funcs = [reward_citation_webgpt, reward_brevity]
     elif preset in ("summarize", "tldr"):
         reward_funcs = [reward_tldr_summarize, reward_brevity]
+    elif preset in ("british", "british_spelling"):
+        reward_funcs = [reward_british_spelling, reward_brevity]
     else:
-        # Fallback to brevity-only to allow running
-        reward_funcs = [reward_brevity]
+        raise ValueError(f"Unknown reward_preset: {cfg.reward_preset}. No fallbacks allowed.")
 
     grad_cb = LayerGradNormCallback(Path(cfg.out_dir) / "gradnorm_layers.jsonl")
+    sparsity_cb = ParamGradSparsityCallback(Path(cfg.out_dir) / "param_grad_sparsity.json")
     trainer = GRPOTrainer(
         model=policy,
         args=args,
         reward_funcs=reward_funcs,
         train_dataset=ds_prompts,
-        callbacks=[grad_cb],
+        callbacks=[grad_cb, sparsity_cb],
     )
     t0 = time()
-    out_state = trainer.train()
+    if cfg.resume_from:
+        out_state = trainer.train(resume_from_checkpoint=cfg.resume_from)
+    else:
+        out_state = trainer.train()
     Path(cfg.out_dir).mkdir(parents=True, exist_ok=True)
     trainer.save_model(cfg.out_dir)
     tokenizer.save_pretrained(cfg.out_dir)

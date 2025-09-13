@@ -9,7 +9,6 @@ import torch
 import tyro
 
 from dpo_adl.backends.hf_hooks import load_model_and_tokenizer, num_layers
-from dpo_adl.data.fineweb import iter_probe_texts
 from dpo_adl.diff.delta_builder import build_delta
 from dpo_adl.dpo.implicit_reward import dpo_margin
 from dpo_adl.eval.steering import generate_text, steered_generation
@@ -24,12 +23,22 @@ from dpo_adl.train.datasets import (
     SyntheticBritishConfig,
     load_hf_preference_dataset,
     chosen_texts_from_spec,
+    sample_texts_from_spec,
 )
+from dpo_adl.train.datasets_hub import load_preference_dataset_hub
 from dpo_adl.train.dpo_trainer import (
     DPOTrainConfig, train_dpo_on_dataset,
     GRPOTrainConfig, train_grpo_on_dataset,
 )
-from dpo_adl.analysis.subnetwork import profile_param_deltas, save_profile
+from dpo_adl.train.thinking import (
+    TrainThinkingConfig, train_grpo_thinking,
+)
+from dpo_adl.analysis.subnetwork import (
+    profile_param_deltas,
+    save_profile,
+    summarize_param_grad_sparsity,
+    summarize_gradnorm_layers,
+)
 from dpo_adl.diff.orth import project_out
 
 
@@ -51,6 +60,8 @@ class CmdBuildDelta:
     def __call__(self):
         Path(self.out).parent.mkdir(parents=True, exist_ok=True)
         # IMPORTANT: texts_iter used twice; collect into list for simplicity
+        # Local import to avoid importing datasets at module import time
+        from dpo_adl.data.fineweb import iter_probe_texts
         texts = list(iter_probe_texts(self.dataset, self.split, self.n_probe, seed=0))
         delta = build_delta(self.ref_model, self.dpo_model, texts, k=self.k, layer_idx=self.layer_idx, batch_size=self.batch_size)
         torch.save({"delta": delta, "k": self.k, "layer_idx": self.layer_idx}, self.out)
@@ -72,6 +83,9 @@ class CmdPatchscope:
     topk: int = 20
     ban_punct: bool = False
     words_only: bool = False
+    show_suppressed: bool = True
+    topk_suppressed: int = 20
+    suppress_intersect: bool = True
     english_words_only: bool = False
 
     def __call__(self):
@@ -167,11 +181,27 @@ class CmdPatchscope:
                     only_punct = False
                     break
             return only_punct
+        # Precompute union of token ids appearing in prompts (to filter prompt-echo artifacts)
+        prompt_token_ids = set()
+        for ptxt in prompts:
+            ids = tok(ptxt, add_special_tokens=False).input_ids
+            for ii in ids:
+                prompt_token_ids.add(int(ii))
+        # Also exclude sentinel id if present
+        try:
+            sent_id = tok.encode(self.sentinel, add_special_tokens=False)
+            if len(sent_id) == 1:
+                prompt_token_ids.add(int(sent_id[0]))
+        except Exception:
+            pass
+
         for j in positions:
             best = None
             alphas = sweep if sweep else [self.alpha]
             for a in alphas:
                 probs_sets = []
+                base_sets = []
+                diffs_per_prompt = []
                 for p in prompts:
                     probs = patchscope_logits(
                         model,
@@ -185,6 +215,13 @@ class CmdPatchscope:
                         expected_norm=expected_norm,
                     )
                     probs_sets.append(probs)
+                    # Baseline (no patch) for suppressed-token analysis
+                    try:
+                        base = __import__("dpo_adl.patchscope.token_identity", fromlist=["baseline_next_token_probs"]).baseline_next_token_probs(model, tok, p)
+                    except Exception:
+                        base = probs.detach().clone() * 0 + (1.0 / probs.numel())
+                    base_sets.append(base)
+                    diffs_per_prompt.append(probs - base)
                 top_idxs_sets = [torch.topk(p, k=100).indices for p in probs_sets]
                 inter = set(top_idxs_sets[0].tolist())
                 for s in top_idxs_sets[1:]:
@@ -192,9 +229,11 @@ class CmdPatchscope:
                 # Optional: remove punctuation-ish tokens from selection set
                 if (self.ban_punct or self.words_only) and len(inter) > 0:
                     inter = {i for i in inter if not _is_banned_token(tok.convert_ids_to_tokens(int(i)))}
+                # Compute average patched and baseline probs for delta analysis
+                avg_p = torch.stack(probs_sets, dim=0).mean(dim=0)
+                avg_p0 = torch.stack(base_sets, dim=0).mean(dim=0)
                 if len(inter) == 0:
                     entropy = float("inf")
-                    avg_p = torch.stack(probs_sets, dim=0).mean(dim=0)
                     # Filter top tokens if requested
                     if (self.ban_punct or self.words_only):
                         toks = []
@@ -209,7 +248,6 @@ class CmdPatchscope:
                     else:
                         top_tokens = top_tokens_from_probs(tok, avg_p, topk=self.topk)
                 else:
-                    avg_p = torch.stack(probs_sets, dim=0).mean(dim=0)
                     mask = torch.zeros_like(avg_p)
                     idx = torch.tensor(sorted(list(inter)), dtype=torch.long)
                     mask[idx] = 1.0
@@ -228,7 +266,48 @@ class CmdPatchscope:
                         top_tokens = toks
                     else:
                         top_tokens = top_tokens_from_probs(tok, avg_p, topk=self.topk)
+                # Suppressed tokens: most negative (avg_p - avg_p0)
+                down_tokens = None
+                if self.show_suppressed:
+                    # Option A: intersection across prompts of top-negative sets
+                    if self.suppress_intersect and len(diffs_per_prompt) >= 2:
+                        neg_sets = []
+                        for d in diffs_per_prompt:
+                            vals_i, idxs_i = torch.topk(-d, k=min(max(self.topk_suppressed*5, 200), d.numel()))
+                            neg_sets.append(set(int(ii) for ii in idxs_i.tolist()))
+                        inter_neg = set.intersection(*neg_sets)
+                        # Remove tokens that appear in prompt to reduce echo artifacts
+                        inter_neg = {ii for ii in inter_neg if ii not in prompt_token_ids}
+                        # Score by average negative magnitude
+                        if len(inter_neg) > 0:
+                            diff_avg = (avg_p - avg_p0)
+                            cand = [(int(ii), float(-diff_avg[int(ii)].item())) for ii in inter_neg]
+                            cand.sort(key=lambda x: x[1], reverse=True)
+                            toks = []
+                            for ii, mag in cand:
+                                ts = tok.convert_ids_to_tokens(ii)
+                                if not _is_banned_token(ts):
+                                    toks.append((ts, mag))
+                                if len(toks) >= self.topk_suppressed:
+                                    break
+                            down_tokens = toks
+                    # Fallback: average diff ranking
+                    if down_tokens is None:
+                        diff = (avg_p - avg_p0)
+                        vals, idxs = torch.topk(-diff, k=min(self.topk_suppressed*5, diff.numel()))
+                        toks = []
+                        for v,i in zip(vals.tolist(), idxs.tolist()):
+                            if int(i) in prompt_token_ids:
+                                continue
+                            ts = tok.convert_ids_to_tokens(int(i))
+                            if not _is_banned_token(ts):
+                                toks.append((ts, -v))
+                            if len(toks) >= self.topk_suppressed:
+                                break
+                        down_tokens = toks
                 cand = {"j": j, "alpha": a, "entropy": entropy, "top": top_tokens}
+                if self.show_suppressed:
+                    cand["suppressed"] = down_tokens
                 if best is None or cand["entropy"] < best["entropy"]:
                     best = cand
             results.append(best)
@@ -236,7 +315,10 @@ class CmdPatchscope:
         if self.j is None:
             results.sort(key=lambda r: r["entropy"])  # lowest entropy first
         for r in results:
-            print(json.dumps({"j": r["j"], "entropy": r["entropy"], "top": r["top"]}, ensure_ascii=False))
+            out = {"j": r["j"], "alpha": r.get("alpha"), "entropy": r["entropy"], "top": r["top"]}
+            if self.show_suppressed and ("suppressed" in r):
+                out["suppressed"] = r["suppressed"]
+            print(json.dumps(out, ensure_ascii=False))
 
 
 @dataclass
@@ -361,11 +443,13 @@ class CmdRunExp:
     embed_to: str = "ref"  # "ref" or "dpo-chosen"
     embed_ds_name: Optional[str] = None
     embed_ds_split: str = "train_prefs"
+    embed_ds_which: str = "chosen"  # 'chosen' | 'rejected'
     embed_ds_n: int = 1000
     # Δ source and selection strategy
     delta_source: str = "fineweb"  # "fineweb" or "dpo-chosen"
     delta_ds_name: Optional[str] = None  # defaults to embed_ds_name if None
     delta_ds_split: str = "train_prefs"
+    delta_ds_which: str = "chosen"  # 'chosen' | 'rejected'
     delta_ds_n: int = 1000
     select_by: str = "entropy"  # "entropy" or "margin"
     # Steering schedule
@@ -427,10 +511,10 @@ class CmdRunExp:
             from dpo_adl.data.fineweb import iter_probe_texts
             texts = list(iter_probe_texts("HuggingFaceFW/fineweb-edu", "train", self.n_probe, seed=0))
         elif self.delta_source == "dpo-chosen":
-            from dpo_adl.train.datasets import chosen_texts_from_spec
             name = self.delta_ds_name or self.embed_ds_name
             assert name is not None, "Provide --delta_ds_name or --embed_ds_name for dpo-chosen Δ source"
-            texts = chosen_texts_from_spec(name, self.delta_ds_split, self.delta_ds_n, seed=0)
+            # Flexible sampling for Δ construction
+            texts = sample_texts_from_spec(name, self.delta_ds_split, self.delta_ds_n, seed=0, which=self.delta_ds_which)
         else:
             raise ValueError("delta_source must be 'fineweb' or 'dpo-chosen'")
         from dpo_adl.diff.delta_builder import build_delta
@@ -741,7 +825,7 @@ class CmdRunExp:
                 sim_st = (E_st @ E_ref.T).diagonal().tolist()
             elif self.embed_to == "dpo-chosen":
                 assert self.embed_ds_name is not None, "Provide --embed_ds_name for dpo-chosen baseline"
-                chosen = chosen_texts_from_spec(self.embed_ds_name, self.embed_ds_split, self.embed_ds_n, seed=0)
+                chosen = sample_texts_from_spec(self.embed_ds_name, self.embed_ds_split, self.embed_ds_n, seed=0, which=self.embed_ds_which)
                 E_chosen = emb.encode(chosen)
                 centroid = E_chosen.mean(dim=0, keepdim=True)
                 centroid = centroid / centroid.norm(p=2)
@@ -817,7 +901,7 @@ class CmdRunExp:
                     sim_un_o = (E_un_o @ E_ref.T).diagonal().tolist()
                     sim_st_o = (E_st_o @ E_ref.T).diagonal().tolist()
                 else:
-                    chosen = chosen_texts_from_spec(self.embed_ds_name, self.embed_ds_split, self.embed_ds_n, seed=0)
+                    chosen = sample_texts_from_spec(self.embed_ds_name, self.embed_ds_split, self.embed_ds_n, seed=0, which=self.embed_ds_which)
                     E_chosen = emb.encode(chosen)
                     centroid = E_chosen.mean(dim=0, keepdim=True)
                     centroid = centroid / centroid.norm(p=2)
@@ -885,8 +969,15 @@ class CmdRunExp:
             if not cand_layers:
                 log.info("No candidate layers for subnetwork correlation; skipping")
                 return
-            # For each candidate layer, compute Patchscope best entropy and holdout margin delta
+            # For each candidate layer, compute a layer-specific Δ using the SAME probe texts,
+            # then Patchscope best entropy and holdout margin delta. Do NOT reuse Δ from a different layer.
             from dpo_adl.patchscope.token_identity import patchscope_logits, DEFAULT_PROMPTS as _TOKID_PROMPTS
+            from dpo_adl.diff.delta_builder import build_delta as _build_delta_for_layer
+            delta_cache: dict[int, torch.Tensor] = {}
+            def _delta_for_layer(li: int) -> torch.Tensor:
+                if li not in delta_cache:
+                    delta_cache[li] = _build_delta_for_layer(self.ref_model, self.dpo_model, texts, k=self.k, layer_idx=li, batch_size=self.batch_size)
+                return delta_cache[li]
             # Expected norm for Patchscope per layer if norm_match
             def _expected_norm_for_layer(layer_idx: int) -> float | None:
                 if not self.norm_match:
@@ -904,12 +995,13 @@ class CmdRunExp:
                 # Patchscope at this layer
                 expected_norm_li = _expected_norm_for_layer(li)
                 best_li = None
+                delta_li = _delta_for_layer(li)
                 for j in range(delta.shape[0]):
                     for a in alphas:
                         probs_sets = []
                         for p in _TOKID_PROMPTS:
                             probs = patchscope_logits(
-                                model, tok, li, delta[j], a, p, self.sentinel, norm_match=self.norm_match, expected_norm=expected_norm_li
+                                model, tok, li, delta_li[j], a, p, self.sentinel, norm_match=self.norm_match, expected_norm=expected_norm_li
                             )
                             probs_sets.append(probs)
                         top_sets = [torch.topk(p, k=100).indices for p in probs_sets]
@@ -917,8 +1009,9 @@ class CmdRunExp:
                         for s in top_sets[1:]:
                             inter &= set(s.tolist())
                         avg_p = torch.stack(probs_sets, dim=0).mean(dim=0)
-                        if self.ban_punct and len(inter) > 0:
+                        if (self.ban_punct or self.words_only) and len(inter) > 0:
                             import unicodedata as _ud
+                            import re as _re
                             def _is_box_or_repeat(t: str) -> bool:
                                 if len(t) >= 3 and all(ch in "-_=~." for ch in t):
                                     return True
@@ -927,9 +1020,37 @@ class CmdRunExp:
                                     if (0x2500 <= code <= 0x257F) or (0x2580 <= code <= 0x259F):
                                         return True
                                 return False
-                            def _is_banned_token(s: str) -> bool:
+                            _EN_RE = _re.compile(r"^[A-Za-z](?:[A-Za-z\-']*[A-Za-z])?$")
+                            def _is_wordlike(s: str) -> bool:
                                 if s is None:
                                     return False
+                                t = s.replace("▁", "").replace("Ġ", "").strip()
+                                if t == "":
+                                    return False
+                                has_letter = any(_ud.category(ch).startswith('L') for ch in t)
+                                if not has_letter:
+                                    return False
+                                for ch in t:
+                                    cat = _ud.category(ch)
+                                    if cat.startswith('L') or cat == 'Nd' or ch in "'’-– " or ch == "-":
+                                        continue
+                                    if cat.startswith('P') or cat.startswith('Z'):
+                                        return False
+                                return True
+                            def _is_english_word(s: str) -> bool:
+                                if s is None:
+                                    return False
+                                t = s.replace("▁", "").replace("Ġ", "").strip()
+                                if t == "":
+                                    return False
+                                return bool(_EN_RE.match(t))
+                            def _is_banned_token(s: str) -> bool:
+                                if s is None:
+                                    return True
+                                if getattr(self, 'english_words_only', False):
+                                    return not _is_english_word(s)
+                                if self.words_only:
+                                    return not _is_wordlike(s)
                                 t = s.strip()
                                 if t == "":
                                     return True
@@ -957,7 +1078,7 @@ class CmdRunExp:
                         if best_li is None or cand["entropy"] < best_li["entropy"]:
                             best_li = cand
                 # Margins on HOLDOUT using best_li
-                d_vec = delta[best_li["j"]]
+                d_vec = delta_li[best_li["j"]]
                 if self.steering_norm_match:
                     from dpo_adl.backends.hf_hooks import estimate_expected_norm
                     # Estimate per-layer steering norm on a small subset of holdout prompts
@@ -1013,12 +1134,27 @@ class CmdRunExp:
             except Exception:
                 pass
 
+            # Recommend best layer by entropy and by margin
+            try:
+                best_by_entropy = min(layer_records.items(), key=lambda kv: kv[1]["best"]["entropy"]) if layer_records else None
+            except Exception:
+                best_by_entropy = None
+            try:
+                best_by_margin = max(layer_records.items(), key=lambda kv: kv[1]["avg_margin_delta"]) if layer_records else None
+            except Exception:
+                best_by_margin = None
             (exp_dir / "artifacts" / "subnetwork_correlation.json").write_text(json.dumps({
                 "candidate_layers": cand_layers,
                 "top_layers_by_delta": top_layers_delta,
                 "top_layers_by_gradnorm": top_layers_grad,
                 "per_layer_best": layer_records,
                 "correlations": corrs,
+                "recommendations": {
+                    "best_layer_by_entropy": best_by_entropy[0] if best_by_entropy else None,
+                    "best_layer_by_margin": best_by_margin[0] if best_by_margin else None,
+                    "best_by_entropy_record": best_by_entropy[1] if best_by_entropy else None,
+                    "best_by_margin_record": best_by_margin[1] if best_by_margin else None,
+                }
             }, indent=2))
 
 
@@ -1075,9 +1211,19 @@ class CmdTrainDPOHF:
     subset: Optional[str] = None
     filter_keywords: Optional[List[str]] = None
     save_steps: int = 0
+    invert: bool = False  # ANTI mode: swap chosen/rejected
 
     def __call__(self):
-        ds = load_hf_preference_dataset(self.dataset, self.split, self.n_pairs, seed=self.seed, subset=self.subset, filter_keywords=self.filter_keywords)
+        # Use strict Hub loader for non-HH datasets to avoid flaky `datasets` issues.
+        name_l = self.dataset.lower()
+        if name_l in {"huggingfaceh4/ultrafeedback_binarized", "ultrafeedback_binarized",
+                      "carperai/openai_summarize_comparisons", "openai_summarize_comparisons"}:
+            ds = load_preference_dataset_hub(self.dataset, self.split, self.n_pairs, seed=self.seed, invert_preferences=self.invert)
+        else:
+            ds = load_hf_preference_dataset(
+                self.dataset, self.split, self.n_pairs, seed=self.seed,
+                subset=self.subset, filter_keywords=self.filter_keywords, invert_preferences=self.invert,
+            )
         cfg = DPOTrainConfig(
             ref_model=self.ref_model,
             out_dir=self.out_dir,
@@ -1094,7 +1240,11 @@ class CmdTrainDPOHF:
             eval_n=256,
         )
         train_dpo_on_dataset(cfg, ds)
-        print(json.dumps({"trained_model": self.out_dir, "dataset": self.dataset, "split": self.split, "pairs": self.n_pairs, "steps": self.max_steps}))
+        print(json.dumps({
+            "trained_model": self.out_dir, "dataset": self.dataset, "split": self.split,
+            "pairs": self.n_pairs, "steps": self.max_steps, "invert": self.invert,
+            "tag": ("ANTI" if self.invert else "NORMAL"),
+        }))
 
 
 
@@ -1147,6 +1297,197 @@ class CmdTrainGRPOHF:
         print(json.dumps({"trained_model": self.out_dir, "dataset": self.dataset, "split": self.split, "pairs": self.n_pairs, "steps": self.max_steps}))
 
 
+@dataclass
+class CmdTrainGRPOBritish:
+    ref_model: str = "Qwen/Qwen2.5-0.5B-Instruct"
+    n_prompts: int = 20000
+    out_dir: str = "assets/trained/grpo_british"
+    learning_rate: float = 1e-5
+    max_steps: int = 2000
+    per_device_train_batch_size: int = 4
+    gradient_accumulation_steps: int = 2
+    max_length: int = 128
+    max_prompt_length: int = 128
+    seed: int = 0
+    save_steps: int = 0
+    resume_from: Optional[str] = None
+
+    def __call__(self):
+        # Procedurally generate prompts requiring British rewrites
+        from dpo_adl.train.grpo_british_prompts import generate_british_prompts_dataset
+        ds = generate_british_prompts_dataset(n=self.n_prompts, seed=self.seed)
+        cfg = GRPOTrainConfig(
+            ref_model=self.ref_model,
+            out_dir=self.out_dir,
+            learning_rate=self.learning_rate,
+            max_steps=self.max_steps,
+            per_device_train_batch_size=self.per_device_train_batch_size,
+            gradient_accumulation_steps=self.gradient_accumulation_steps,
+            max_length=self.max_length,
+            max_prompt_length=self.max_prompt_length,
+            seed=self.seed,
+            save_steps=self.save_steps,
+            eval_n=512,
+            reward_preset="british",
+            resume_from=self.resume_from,
+        )
+        train_grpo_on_dataset(cfg, ds)
+        print(json.dumps({"trained_model": self.out_dir, "dataset": "synthetic_british_prompts", "prompts": self.n_prompts, "steps": self.max_steps}))
+
+
+@dataclass
+class CmdTrainGRPOThinking:
+    ref_model: str = "Qwen/Qwen2.5-0.5B-Instruct"
+    out_dir: str = "assets/trained/grpo_thinking"
+    dataset_id: str = "AI-MO/NuminaMath-TIR"
+    train_split: str = "train[:5%]"
+    lora: bool = True
+    lora_r: int = 8
+    lora_alpha: int = 32
+    lora_dropout: float = 0.10
+    lora_targets: str = "q_proj,v_proj"
+    learning_rate: float = 1e-5
+    num_train_epochs: int = 1
+    gradient_accumulation_steps: int = 16
+    bf16: bool = True
+    max_completion_length: int = 64
+    num_generations: int = 4
+    max_prompt_length: int = 128
+    save_steps: int = 50
+    logging_steps: int = 10
+    push_to_hub: bool = False
+    # Keep system prompt configurable but with a sensible default
+    system_prompt: str = __import__("dpo_adl.train.thinking", fromlist=["SYSTEM_PROMPT_DEFAULT"]).SYSTEM_PROMPT_DEFAULT  # type: ignore
+    # DDP + steps
+    per_device_train_batch_size: int = 1
+    max_steps: Optional[int] = None
+    ddp: bool = False
+
+    def __call__(self):
+        cfg = TrainThinkingConfig(
+            ref_model=self.ref_model,
+            out_dir=self.out_dir,
+            dataset_id=self.dataset_id,
+            train_split=self.train_split,
+            lora=self.lora,
+            lora_r=self.lora_r,
+            lora_alpha=self.lora_alpha,
+            lora_dropout=self.lora_dropout,
+            lora_targets=self.lora_targets,
+            learning_rate=self.learning_rate,
+            num_train_epochs=self.num_train_epochs,
+            gradient_accumulation_steps=self.gradient_accumulation_steps,
+            bf16=self.bf16,
+            max_completion_length=self.max_completion_length,
+            num_generations=self.num_generations,
+            max_prompt_length=self.max_prompt_length,
+            save_steps=self.save_steps,
+            logging_steps=self.logging_steps,
+            push_to_hub=self.push_to_hub,
+            system_prompt=self.system_prompt,
+            per_device_train_batch_size=self.per_device_train_batch_size,
+            max_steps=self.max_steps,
+            ddp=self.ddp,
+        )
+        out = train_grpo_thinking(cfg)
+        print(json.dumps(out))
+
+
+@dataclass
+class CmdSummarizeRun:
+    run_dir: str
+    pct_threshold: float = 0.05
+
+    def __call__(self):
+        base = Path(self.run_dir)
+        out_dir = base / "analysis"
+        # Optionally emit profile summary if profile exists
+        prof = base / "analysis" / "subnetwork_profile.json"
+        if prof.exists():
+            try:
+                obj = json.loads(prof.read_text())
+                # Reuse helper to emit profile summary alongside existing outputs
+                __import__("dpo_adl.analysis.subnetwork", fromlist=["_emit_profile_summary"])._emit_profile_summary(obj, out_dir)
+            except Exception:
+                pass
+        # Summaries from training logs
+        spars = base / "param_grad_sparsity.json"
+        if spars.exists():
+            summarize_param_grad_sparsity(spars, out_dir, pct_threshold=self.pct_threshold)
+        gnl = base / "gradnorm_layers.jsonl"
+        if gnl.exists():
+            summarize_gradnorm_layers(gnl, out_dir)
+        # Report emitted files
+        out = {
+            "run_dir": str(base),
+            "analysis_dir": str(out_dir),
+            "emitted": [
+                str(p) for p in [
+                    out_dir / "subnetwork_profile_summary.json",
+                    out_dir / "param_grad_sparsity_summary.json",
+                    out_dir / "gradnorm_layers_summary.json",
+                ] if p.exists()
+            ],
+        }
+        print(json.dumps(out, indent=2))
+
+
+@dataclass
+class CmdCompareRuns:
+    run_a: str
+    run_b: str
+    out_json: str = "artifacts/run_comparison.json"
+
+    def __call__(self):
+        a = Path(self.run_a) / "analysis"
+        b = Path(self.run_b) / "analysis"
+        def loadj(p: Path):
+            try:
+                return json.loads(p.read_text())
+            except Exception:
+                return None
+        prof_a = loadj(a / "subnetwork_profile_summary.json")
+        prof_b = loadj(b / "subnetwork_profile_summary.json")
+        gn_a = loadj(a / "gradnorm_layers_summary.json")
+        gn_b = loadj(b / "gradnorm_layers_summary.json")
+        sp_a = loadj(a / "param_grad_sparsity_summary.json")
+        sp_b = loadj(b / "param_grad_sparsity_summary.json")
+        comp = {
+            "runs": {"A": str(self.run_a), "B": str(self.run_b)},
+            "profile": None,
+            "gradnorm": None,
+            "sparsity": None,
+        }
+        if prof_a and prof_b:
+            ta = set(prof_a.get("top_layers", []))
+            tb = set(prof_b.get("top_layers", []))
+            comp["profile"] = {
+                "A": prof_a,
+                "B": prof_b,
+                "overlap_top_layers": sorted(ta & tb),
+            }
+        if gn_a and gn_b:
+            ta = set(gn_a.get("top_layers", []))
+            tb = set(gn_b.get("top_layers", []))
+            comp["gradnorm"] = {
+                "A": {"top_layers": gn_a.get("top_layers", [])},
+                "B": {"top_layers": gn_b.get("top_layers", [])},
+                "overlap_top_layers": sorted(ta & tb),
+            }
+        if sp_a and sp_b:
+            ta = set(sp_a.get("most_frozen_layers", []))
+            tb = set(sp_b.get("most_frozen_layers", []))
+            comp["sparsity"] = {
+                "A": {"most_frozen_layers": sp_a.get("most_frozen_layers", [])},
+                "B": {"most_frozen_layers": sp_b.get("most_frozen_layers", [])},
+                "overlap_most_frozen": sorted(ta & tb),
+                "thresholds": {"A": sp_a.get("sum_rms_threshold"), "B": sp_b.get("sum_rms_threshold")},
+            }
+        Path(self.out_json).parent.mkdir(parents=True, exist_ok=True)
+        Path(self.out_json).write_text(json.dumps(comp, indent=2))
+        print(json.dumps({"wrote": self.out_json, "keys": list(k for k,v in comp.items() if v)}, indent=2))
+
+
 def main():
     import sys
     if len(sys.argv) <= 1:
@@ -1175,6 +1516,18 @@ def main():
     elif cmd == "train-grpo-hf":
         tyro.extras.set_accent_color("yellow")
         tyro.cli(CmdTrainGRPOHF, args=args)()
+    elif cmd == "train-grpo-thinking":
+        tyro.extras.set_accent_color("yellow")
+        tyro.cli(CmdTrainGRPOThinking, args=args)()
+    elif cmd == "train-grpo-british":
+        tyro.extras.set_accent_color("yellow")
+        tyro.cli(CmdTrainGRPOBritish, args=args)()
+    elif cmd == "summarize-run":
+        tyro.extras.set_accent_color("green")
+        tyro.cli(CmdSummarizeRun, args=args)()
+    elif cmd == "compare-runs":
+        tyro.extras.set_accent_color("green")
+        tyro.cli(CmdCompareRuns, args=args)()
     elif cmd == "profile-subnetwork":
         @dataclass
         class CmdProfileSubnetwork:

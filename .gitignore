@@ -8,6 +8,8 @@ __pycache__/
 *.so
 .pytest_cache/
 .mypy_cache/
+.ruff_cache/
+.hypothesis/
 
 # Build artifacts
 build/
@@ -17,8 +19,10 @@ dist/
 # Data & outputs
 artifacts/
 logs/
-# Experiment outputs: include plots/PDFs and JSONs; ignore code snapshots
-assets/experiments/outputs/*/code/
+*.log
+# Experiment outputs (large, reproducible)
+assets/experiments/outputs/
+# If you need code snapshots from runs, they are in outputs/*/code/ in your local workspace
 assets/trained/
 *.pt
 *.bin
@@ -30,3 +34,4 @@ assets/trained/
 Thumbs.db
 .idea/
 .vscode/
+.python-version

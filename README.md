@@ -1,113 +1,117 @@
-## DPO-ADL (Activation-Difference Lens for DPO)
+## Anubis — Activation-Difference Lens and Steering
 
-This repository provides a minimal, reproducible scaffold to compute early-token activation differences between a DPO policy and its DPO reference model (π_dpo − π_ref), read them with a token-identity Patchscope, and evaluate steering and DPO implicit-reward margins.
+Anubis is a compact toolkit for analyzing and steering instruction-/preference‑tuned language models via activation differences.
 
-Key ideas mirror the Alignment Forum update “Narrow Finetuning Leaves Clearly Readable Traces in Activation Differences” and adapt them to DPO by diffing π_dpo vs π_ref on unrelated text.
+It lets you:
+- Build Δ (policy − reference) on unrelated or in‑distribution text.
+- Read Δ with a token‑identity Patchscope to surface boosted/suppressed tokens.
+- Steer generation by injecting Δ and measure downstream effects (e.g., DPO implicit‑reward margins).
 
-### Quickstart
-
-1) Install
+### Install
 
 ```
 pip install -e .
 ```
 
-2) Build Δ on unrelated text (FineWeb-Edu streaming) for positions j∈{0..4} at mid layer:
+The CLI entrypoint is `anubis`. For backward compatibility, `dpo-adl` also works.
+
+### Quickstart
+
+1) Build Δ on unrelated text (FineWeb‑Edu) for positions j∈{0..4} at the mid layer:
 
 ```
-dpo-adl build-delta \
+anubis build-delta \
   --ref_model <hf-org/ref-model> \
-  --dpo_model <hf-org/dpo-model> \
+  --dpo_model <hf-org/policy-model> \
   --n_probe 10000 --k 5 \
   --out artifacts/delta.pt
 ```
 
-3) Patchscope readout (token-identity prompts) and print Top-20 tokens per best j:
+2) Patchscope readout (token‑identity prompts) and print Top‑N tokens for the best (j, α):
 
 ```
-dpo-adl patchscope \
-  --reader_model <hf-org/dpo-model> \
-  --delta artifacts/delta.pt
+anubis patchscope \
+  --reader_model <hf-org/policy-model> \
+  --delta artifacts/delta.pt \
+  --alpha_sweep 0.5,1.0,1.5,2.0
 ```
 
-4) Steering + DPO implicit-reward margin on neutral prompts (now steers during generation by default; margins use token-accurate completions):
+3) Steering + DPO implicit‑reward margins on a small prompt set:
 
 ```
-dpo-adl eval-steer \
+anubis eval-steer \
   --ref_model <hf-org/ref-model> \
-  --dpo_model <hf-org/dpo-model> \
+  --dpo_model <hf-org/policy-model> \
   --delta artifacts/delta.pt \
   --prompts prompts/generic20.txt \
-  --positions first_n --first_n 16
+  --positions first_n --first_n 16 \
+  --max_new_tokens 64 --temperature 0.0
 ```
 
 Notes:
-- Ensure the reader/steering layer index matches the layer used for Δ. If you built Δ with this tool, we record and reuse the layer index by default.
-- For Patchscope, the prompt uses a single-token '?' sentinel; if your tokenizer splits '?', change `--prompt_sentinel` to a single-token alternative (e.g., '!').
-- Steering defaults to injecting Δ only during generation (`--positions first_n`) for the first 16 tokens. Use `--positions all` to inject during prefill as well.
+- If you did not specify `--layer_idx` when building Δ, Anubis records and reuses the mid‑layer by default.
+- Patchscope requires that the sentinel be a single token for your tokenizer (default '?'). If '?' splits, set `--sentinel '!'` (or another single‑token mark).
+- Steering schedule defaults to injecting during generation only (`--positions first_n`). Use `--positions all` to also inject during prefill.
 
-### What this scaffold includes
+### One‑Shot Report
 
-- Residual capture hooks at a target decoder layer (forward_pre) to stream per-position means.
-- Δ_j construction: mean_dpo[j] − mean_ref[j] for j in 0..k−1.
-- Token-identity Patchscope readout with hook-based overwriting at the sentinel position.
-- Δ-steering during generation and DPO implicit-reward margin computation (token-accurate completion boundaries).
-
-### Limitations
-
-- Hook paths are implemented for common HF CausalLMs (LLaMA/Qwen/GPTNeoX-like); other architectures may require adjusting the layer resolution helper.
-- No external graders/embeddings; this is a minimal core to extend.
-
-### Train a Narrow DPO Policy
-
-Safest default uses a synthetic, harmless British-vs-American spelling preference set.
-
-Train on top of your SFT reference (kept fixed as π_ref):
+Create a timestamped experiment folder with Patchscope plots, holdout margins, and (optionally) a PDF bundle:
 
 ```
-dpo-adl train-dpo \
+anubis run-exp \
+  --name EXP_DPO_VS_REF \
+  --ref_model Qwen/Qwen2.5-0.5B-Instruct \
+  --dpo_model assets/trained/dpo_british \
+  --n_probe 1200 --k 5 --batch_size 16 \
+  --prompts prompts/generic20.txt \
+  --alpha_sweep 0.5,1.0,1.5,2.0 \
+  --positions first_n --first_n 16 \
+  --max_new_tokens 64 --temperature 0.0 \
+  --make_pdf True
+```
+
+### Training Helpers (optional)
+
+Train a narrow DPO policy on top of your instruct model (reference stays fixed as π_ref):
+
+```
+anubis train-dpo \
   --ref_model Qwen/Qwen2.5-0.5B-Instruct \
   --out_dir assets/trained/dpo_british \
   --n_pairs 200 --max_steps 60 --use_lora True
 ```
 
-Optionally, use a curated HF preference dataset (explicit choice required):
+Use a curated HF preference dataset:
 
 ```
-dpo-adl train-dpo-hf \
+anubis train-dpo-hf \
   --ref_model Qwen/Qwen2.5-0.5B-Instruct \
   --dataset HuggingFaceH4/ultrafeedback_binarized --split train_prefs \
   --n_pairs 1000 --max_steps 60 --use_lora True \
   --out_dir assets/trained/dpo_hf
 ```
 
-Important: Review dataset terms and content policies before use. This repo defaults to synthetic data; HF datasets are opt-in.
+### Embeddings (optional)
 
-### One-Shot Report
-
-Build Δ, run Patchscope, steer, and generate plots (entropy curves, margins, embedding sims). Produces a timestamped folder and an optional PDF bundle.
+Enable embeddings by providing a Hugging Face encoder and `--embed_provider hf` (no fallbacks):
 
 ```
-dpo-adl run-exp \
-  --name EXP04_dpo_vs_ref \
-  --ref_model Qwen/Qwen2.5-0.5B-Instruct \
-  --dpo_model assets/trained/dpo_british \
-  --n_probe 1200 --k 5 --batch_size 16 \
-  --prompts prompts/generic20.txt --alpha_sweep 0.5,1.0,1.5,2.0 \
-  --positions first_n --first_n 16 \
-  --max_new_tokens 48 --temperature 0.0 --make_pdf True
-```
-
-The plots are styled for readability in one go (larger fonts, grids, and summary annotations such as means and best-α markers).
-
-### Embeddings backend (no fallbacks)
-
-Embeddings are disabled by default. To enable, you must explicitly provide a HuggingFace encoder model and set `--embed_provider hf`. There is no SentenceTransformers fallback. Example:
-
-```
-dpo-adl run-exp \
+anubis run-exp \
   --embed_provider hf \
-  --embed_model Qwen/Qwen3-Embedding-0.6B  # example; pick your exact HF id
+  --embed_model Qwen/Qwen3-Embedding-0.6B
 ```
 
-If you do not provide both `--embed_provider hf` and a valid `--embed_model`, embeddings are skipped or the program fails fast when invoked in embedding mode. This avoids giving the impression of completeness when an intended dependency is missing.
+### In‑Distribution Options
+
+For Δ/embeddings from preference datasets, you can choose sides:
+- `--delta-source dpo-chosen --delta-ds-name <dataset>` with `--delta-ds-which chosen|rejected`.
+- `--embed-to dpo-chosen --embed-ds-name <dataset>` with `--embed-ds-which chosen|rejected`.
+
+### Limitations
+
+- Hook paths cover common HF CausalLMs (LLaMA/Qwen/GPTNeoX‑like). Some architectures may require a small resolver tweak.
+- Embeddings require explicit models and are disabled by default to avoid partial results.
+
+### Backward Compatibility
+
+- The old CLI name `dpo-adl` remains available as an alias for `anubis`.

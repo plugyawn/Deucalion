@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 from dataclasses import dataclass
 from typing import Callable, Optional, Tuple
+import os
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
@@ -30,23 +31,41 @@ def load_model_and_tokenizer(model_id: str, dtype: str = "auto") -> Tuple[PreTra
         torch_dtype = torch.float32
 
     tok = AutoTokenizer.from_pretrained(model_id, use_fast=True)
+    # Allow overriding device_map via env (e.g., DPO_ADL_DEVICE_MAP=balanced)
+    device_map = os.environ.get("DPO_ADL_DEVICE_MAP", "auto")
     # Detect PEFT adapter directory and load accordingly
     model_path = Path(model_id)
     peft_candidates = {"adapter_config.json", "adapter_model.safetensors"}
     is_peft_dir = model_path.is_dir() and any((model_path / f).exists() for f in peft_candidates)
+    # Prepare optional max_memory per device to encourage using all visible GPUs
+    max_memory = None
+    try:
+        if torch.cuda.is_available():
+            max_memory = {}
+            n = torch.cuda.device_count()
+            for i in range(n):
+                props = torch.cuda.get_device_properties(i)
+                # Reserve ~2% headroom
+                gb = max(1, int((props.total_memory * 0.98) // (1024**3)))
+                max_memory[i] = f"{gb}GiB"
+    except Exception:
+        max_memory = None
+
     if is_peft_dir:
         from peft import AutoPeftModelForCausalLM  # require peft when adapter detected
         model = AutoPeftModelForCausalLM.from_pretrained(
             model_id,
             torch_dtype=torch_dtype,
-            device_map="auto",
+            device_map=device_map,
+            max_memory=max_memory,
             low_cpu_mem_usage=True,
         )
     else:
         model = AutoModelForCausalLM.from_pretrained(
             model_id,
             torch_dtype=torch_dtype,
-            device_map="auto",
+            device_map=device_map,
+            max_memory=max_memory,
             low_cpu_mem_usage=True,
         )
     model.eval()
