@@ -8,6 +8,7 @@ __pycache__/
 *.so
 .pytest_cache/
 .mypy_cache/
+.hf_cache/
 .ruff_cache/
 .hypothesis/
 
