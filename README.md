@@ -1,4 +1,4 @@
-## Anubis — Activation-Difference Lens and Steering
+## Anubis
 
 Anubis is a compact toolkit for analyzing and steering instruction-/preference‑tuned language models via activation differences.
 
@@ -13,7 +13,7 @@ It lets you:
 pip install -e .
 ```
 
-The CLI entrypoint is `anubis`. For backward compatibility, `dpo-adl` also works.
+The CLI entrypoint is `anubis`. 
 
 ### Quickstart
 
@@ -112,6 +112,3 @@ For Δ/embeddings from preference datasets, you can choose sides:
 - Hook paths cover common HF CausalLMs (LLaMA/Qwen/GPTNeoX‑like). Some architectures may require a small resolver tweak.
 - Embeddings require explicit models and are disabled by default to avoid partial results.
 
-### Backward Compatibility
-
-- The old CLI name `dpo-adl` remains available as an alias for `anubis`.
